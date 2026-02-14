@@ -1,4 +1,4 @@
-# ast-index v3.14.0
+# ast-index v3.15.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -170,6 +170,8 @@ ast-index version                  # Version info
 
 Supported elements:
 - Classes, interfaces, type aliases, enums
+- Class methods (constructor, getters/setters, static, async)
+- Class fields/properties, private `#members`, abstract methods
 - Functions (regular, arrow, async)
 - React components and hooks (`useXxx`)
 - Vue SFC (`<script>` extraction)
@@ -320,6 +322,9 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.15.0
+- **TypeScript class members** — index class methods (constructor, getters/setters, static, async), fields/properties, private `#members`, and abstract methods; object literal methods correctly excluded
 
 ### 3.14.0
 - **`map` command** — compact project overview: top directories by size with symbol kind counts; `--module` for detailed drill-down with classes and inheritance
