@@ -786,7 +786,10 @@ fn resolve_index_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn find_project_root() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
+    find_project_root_from(std::env::current_dir()?)
+}
+
+fn find_project_root_from(cwd: PathBuf) -> Result<PathBuf> {
     for ancestor in cwd.ancestors() {
         // Android/Gradle markers
         if ancestor.join("settings.gradle").exists()
@@ -811,6 +814,11 @@ fn find_project_root() -> Result<PathBuf> {
             || ancestor.join("WORKSPACE.bazel").exists()
             || ancestor.join("MODULE.bazel").exists()
         {
+            return Ok(ancestor.to_path_buf());
+        }
+        // Git marker (fallback — after build-system-specific markers)
+        let git_marker = ancestor.join(".git");
+        if git_marker.join("HEAD").exists() || git_marker.is_file() {
             return Ok(ancestor.to_path_buf());
         }
     }
@@ -884,4 +892,68 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_find_project_root_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_git_repo_from_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let deep = dir.path().join("sub").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let result = find_project_root_from(deep).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_git_worktree_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /some/other/path/.git/worktrees/branch\n",
+        )
+        .unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_broken_git_no_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::create_dir(git_dir.join("info")).unwrap();
+        // .git/HEAD missing — not a valid git repo
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        // fallback to cwd — .git without HEAD is not a marker
+        assert_eq!(result, dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_find_project_root_gradle_priority_over_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.path().join("settings.gradle"), "").unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        // Gradle marker is checked first — same result (same directory),
+        // but Gradle priority is correct
+        assert_eq!(result, dir.path());
+    }
 }

@@ -308,6 +308,7 @@ Benchmarks on large Android project (~29k files, ~300k symbols):
 - **grep-searcher** — ripgrep internals for fast searching
 - **SQLite + FTS5** — full-text search index
 - **rayon** — parallel file parsing
+- **Project root detection** — `settings.gradle(.kts)` > `Package.swift` > `.xcodeproj` > `WORKSPACE`/`MODULE.bazel` > `.git`
 - **ignore** — gitignore-aware directory traversal
 
 ### Database Schema
@@ -334,6 +335,7 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ### 3.16.0
 - **`restore` command** — restore index from a `.db` file: `ast-index restore /path/to/index.db`
 - **`--index-path` flag** — use custom index database: `ast-index --index-path /path/to/index.db stats`
+- **`.git` project root detection** — `.git` as fallback marker after build-system-specific markers (Gradle, Swift, Xcode, Bazel); validates `.git/HEAD` exists or `.git` is file (worktree/submodule)
 
 ### 3.15.0
 - **TypeScript class members** — index class methods (constructor, getters/setters, static, async), fields/properties, private `#members`, and abstract methods; object literal methods correctly excluded
