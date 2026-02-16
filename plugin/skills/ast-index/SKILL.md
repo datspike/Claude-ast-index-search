@@ -283,6 +283,7 @@ ast-index rebuild --no-ignore        # Include gitignored files
 ast-index update                     # Incremental update
 ast-index stats                      # Show index statistics
 ast-index clear                      # Delete index for current project
+ast-index restore /path/to/index.db  # Restore index from a .db file
 ast-index watch                      # Watch for file changes and auto-update index
 ```
 
