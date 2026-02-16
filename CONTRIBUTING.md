@@ -43,7 +43,7 @@ src/
     ios.rs                         # storyboard-usages, asset-usages, swiftui
     perl.rs                        # perl-exports, perl-subs, perl-pod
     grep.rs                        # grep-based commands (todo, callers, etc.)
-    management.rs                  # stats, version, install-claude-plugin
+    management.rs                  # stats, version, restore, install-claude-plugin
     project_info.rs                # map, conventions
     watch.rs                       # watch (filesystem watcher)
 ```
