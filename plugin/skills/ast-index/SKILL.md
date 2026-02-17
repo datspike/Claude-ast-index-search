@@ -296,16 +296,34 @@ Most search commands (`search`, `symbol`, `class`, `usages`, `implementations`) 
 ## Index Management
 
 ```bash
-ast-index init                           # Initialize index for current project
 ast-index rebuild                        # Full rebuild with dependencies
 ast-index rebuild --no-deps              # Skip module dependency indexing
 ast-index rebuild --no-ignore            # Include gitignored files (build/, etc.)
+ast-index rebuild --sub-projects         # Index each sub-project separately (large monorepos)
+ast-index rebuild -j 32                  # Use 32 threads (for network/FUSE filesystems)
+ast-index rebuild -v                     # Verbose logging with timing per step
 ast-index update                         # Incremental update (changed files only)
 ast-index stats                          # Show index statistics
 ast-index clear                          # Delete index for current project
 ast-index restore /path/to/index.db      # Restore index from a .db file
 ast-index watch                          # Watch for file changes and auto-update index
 ```
+
+### Directory-Scoped Search
+
+`rebuild` creates a `.ast-index-root` marker file in the project root. When running search from a subdirectory, results are automatically limited to that subtree:
+
+```bash
+cd /project/root
+ast-index rebuild                        # Index entire project, creates .ast-index-root
+ast-index search "Payment"              # Finds results across entire project
+
+cd /project/root/services/payments
+ast-index search "Payment"              # Only finds results within services/payments/
+ast-index class "PaymentService"        # Only classes in services/payments/ subtree
+```
+
+This works with all search commands: `search`, `symbol`, `class`, `implementations`, `usages`.
 
 ## Multi-Root Projects
 

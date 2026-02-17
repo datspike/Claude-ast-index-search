@@ -35,7 +35,10 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize, format: &str, scope: &
 
     // 1. Search in file paths (index)
     let files_start = Instant::now();
-    let files = db::find_files(&conn, query, limit)?;
+    let mut files = db::find_files(&conn, query, limit)?;
+    if let Some(prefix) = scope.dir_prefix {
+        files.retain(|f| f.starts_with(prefix));
+    }
     let files_time = files_start.elapsed();
 
     // 2. Search in symbols using FTS or fuzzy (index)
@@ -56,6 +59,9 @@ pub fn cmd_search(root: &Path, query: &str, limit: usize, format: &str, scope: &
     super::search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "py", "go", "rs", "cpp", "c", "proto"], limit, |path, line_num, line| {
         let rel_path = super::relative_path(root, path);
         // Apply scope filter for grep results
+        if let Some(prefix) = scope.dir_prefix {
+            if !rel_path.starts_with(prefix) { return; }
+        }
         if let Some(in_file) = scope.in_file {
             if !rel_path.contains(in_file) { return; }
         }

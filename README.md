@@ -1,4 +1,4 @@
-# ast-index v3.17.3
+# ast-index v3.17.4
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -322,6 +322,11 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.17.4
+- **`.ast-index-root` marker** — `rebuild` creates a marker file so search works from any subdirectory
+- **Directory-scoped search** — when running from a subdirectory, results are automatically limited to that subtree
+- **`clear` removes marker** — cleaning index also removes the root marker
 
 ### 3.17.3
 - **`--threads` / `-j` flag for rebuild** — control parallel threads (e.g. `-j 32` for network filesystems where I/O is the bottleneck)

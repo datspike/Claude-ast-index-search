@@ -597,6 +597,21 @@ fn main() -> Result<()> {
     // Migrate project DB from old kotlin-index to ast-index
     db::migrate_legacy_project(&root);
 
+    // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let dir_prefix = if cwd != root {
+        cwd.strip_prefix(&root)
+            .ok()
+            .map(|rel| {
+                let mut s = rel.to_string_lossy().to_string();
+                if !s.ends_with('/') { s.push('/'); }
+                s
+            })
+    } else {
+        None
+    };
+    let dir_prefix_ref = dir_prefix.as_deref();
+
     match cli.command {
         // Grep commands
         Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
@@ -625,25 +640,25 @@ fn main() -> Result<()> {
         Commands::Stats => commands::management::cmd_stats(&root, format),
         // Index commands
         Commands::Search { query, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_search(&root, &query, limit, format, &scope, fuzzy)
         }
         Commands::Symbol { name, r#type, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_symbol(&root, &name, r#type.as_deref(), limit, format, &scope, fuzzy)
         }
         Commands::Class { name, limit, in_file, module, fuzzy } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_class(&root, &name, limit, format, &scope, fuzzy)
         }
         Commands::Implementations { parent, limit, in_file, module } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
         }
         Commands::Refs { symbol, limit } => commands::index::cmd_refs(&root, &symbol, limit, format),
         Commands::Hierarchy { name } => commands::index::cmd_hierarchy(&root, &name),
         Commands::Usages { symbol, limit, in_file, module } => {
-            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref() };
+            let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_usages(&root, &symbol, limit, format, &scope)
         }
         // Module commands
@@ -754,6 +769,10 @@ fn cmd_install_claude_plugin() -> Result<()> {
 fn find_project_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     for ancestor in cwd.ancestors() {
+        // ast-index marker (created by rebuild)
+        if ancestor.join(".ast-index-root").exists() {
+            return Ok(ancestor.to_path_buf());
+        }
         // Android/Gradle markers
         if ancestor.join("settings.gradle").exists()
             || ancestor.join("settings.gradle.kts").exists()

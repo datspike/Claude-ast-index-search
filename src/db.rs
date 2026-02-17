@@ -894,21 +894,27 @@ pub fn search_symbols_fuzzy(
 pub struct SearchScope<'a> {
     pub in_file: Option<&'a str>,
     pub module: Option<&'a str>,
+    /// Directory prefix filter: only return results under this path (relative to project root)
+    pub dir_prefix: Option<&'a str>,
 }
 
 impl<'a> SearchScope<'a> {
     pub fn none() -> Self {
-        SearchScope { in_file: None, module: None }
+        SearchScope { in_file: None, module: None, dir_prefix: None }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.in_file.is_none() && self.module.is_none()
+        self.in_file.is_none() && self.module.is_none() && self.dir_prefix.is_none()
     }
 
     /// Build WHERE clause fragment and collect params
     fn path_condition(&self) -> (String, Vec<String>) {
         let mut conditions = Vec::new();
         let mut params = Vec::new();
+        if let Some(prefix) = self.dir_prefix {
+            conditions.push("f.path LIKE ?".to_string());
+            params.push(format!("{}%", prefix));
+        }
         if let Some(file) = self.in_file {
             conditions.push("f.path LIKE ?".to_string());
             params.push(format!("%{}", file));
