@@ -362,11 +362,13 @@ pub fn has_arc_repo(root: &Path) -> bool {
 
 /// Quickly count source files in a directory, stopping at `limit`.
 /// Returns the count (capped at `limit`) — avoids full traversal for large dirs.
+/// Quick file count for auto-detection threshold.
+/// Intentionally skips arc/gitignore checks — this is just a rough estimate,
+/// and stat-ing .gitignore on every dir is too slow on FUSE mounts.
 pub fn quick_file_count(root: &Path, no_ignore: bool, limit: usize) -> usize {
     use ignore::WalkBuilder;
 
     let use_git = has_git_repo(root) && !no_ignore;
-    let arc_root = if no_ignore { None } else { find_arc_root(root) };
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -375,14 +377,8 @@ pub fn quick_file_count(root: &Path, no_ignore: bool, limit: usize) -> usize {
         .git_ignore(use_git)
         .git_exclude(use_git)
         .filter_entry(|entry| !is_excluded_dir(entry));
-    if let Some(ref arc) = arc_root {
-        builder.add_custom_ignore_filename(".gitignore");
-        builder.add_custom_ignore_filename(".arcignore");
-        let root_gitignore = arc.join(".gitignore");
-        if root_gitignore.exists() {
-            builder.add_ignore(root_gitignore);
-        }
-    }
+    // No arc ignore here — quick_file_count is just a rough estimate,
+    // and add_custom_ignore_filename causes stat per directory (slow on FUSE)
 
     let mut count = 0;
     for entry in builder.build().filter_map(|e| e.ok()) {

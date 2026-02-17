@@ -40,6 +40,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
             eprintln!("[verbose] find_sub_projects: {} found in {:?}", subs.len(), t.elapsed());
         }
         if subs.len() >= 2 {
+            if verbose { eprintln!("[verbose] counting files (quick_file_count, limit={})...", AUTO_SUB_PROJECTS_THRESHOLD); }
             let t = Instant::now();
             let file_count = indexer::quick_file_count(root, no_ignore, AUTO_SUB_PROJECTS_THRESHOLD);
             if verbose {

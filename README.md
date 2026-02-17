@@ -1,4 +1,4 @@
-# ast-index v3.17.1
+# ast-index v3.17.2
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -322,6 +322,9 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.17.2
+- **Fix FUSE hang on auto-detection** — `quick_file_count` no longer stat-s `.gitignore`/`.arcignore` per directory, which caused hangs on FUSE-mounted repos
 
 ### 3.17.1
 - **`--verbose` flag for rebuild** — detailed timing logs for every step (walk, parse, DB write, lock, modules, deps) to diagnose performance issues
