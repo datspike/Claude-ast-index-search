@@ -239,6 +239,9 @@ enum Commands {
         /// Verbose logging with timing for each step
         #[arg(long, short)]
         verbose: bool,
+        /// Number of parallel threads (default: CPU cores, max 8; increase for network filesystems)
+        #[arg(long, short = 'j')]
+        threads: Option<usize>,
     },
     /// Update index (incremental)
     Update,
@@ -611,7 +614,12 @@ fn main() -> Result<()> {
         Commands::Flows { query, limit } => commands::grep::cmd_flows(&root, query.as_deref(), limit),
         Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
         // Management commands
-        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, verbose } => commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, verbose),
+        Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, verbose, threads } => {
+            if let Some(t) = threads {
+                std::env::set_var("AST_INDEX_THREADS", t.to_string());
+            }
+            commands::management::cmd_rebuild(&root, &r#type, !no_deps, no_ignore, sub_projects, verbose)
+        }
         Commands::Update => commands::management::cmd_update(&root),
         Commands::Restore { path } => commands::management::cmd_restore(&root, &path),
         Commands::Stats => commands::management::cmd_stats(&root, format),

@@ -542,10 +542,16 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
     let mut total_count = 0;
     let parsed_global = Arc::new(AtomicUsize::new(0));
 
-    // Limit rayon parallelism to cap peak memory (each thread holds file content + ParsedFile)
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4);
+    // Thread count: --threads flag > AST_INDEX_THREADS env > CPU cores (max 8 for local, higher for network FS)
+    let num_threads = std::env::var("AST_INDEX_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|n| n.get().min(8))
+                .unwrap_or(4)
+        });
     if verbose { eprintln!("[verbose] using {} threads for parsing", num_threads); }
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
