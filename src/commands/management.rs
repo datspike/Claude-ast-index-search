@@ -254,7 +254,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
 
             if index_deps {
                 println!("{}", "Indexing module dependencies...".cyan());
-                let gradle_files = indexer::collect_gradle_files_from_db(&conn, root)?;
+                let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
                 let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 println!(
                     "{}",
@@ -266,7 +266,7 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         }
         "deps" => {
             println!("{}", "Indexing module dependencies...".cyan());
-            let gradle_files = indexer::collect_gradle_files_from_db(&conn, root)?;
+            let gradle_files = indexer::collect_build_files_from_db(&conn, root)?;
             let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
             println!("{}", format!("Indexed {} dependencies", dep_count).green());
         }

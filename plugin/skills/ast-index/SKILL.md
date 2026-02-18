@@ -44,7 +44,7 @@ The index is stored at `~/Library/Caches/ast-index/<project-hash>/index.db` (mac
 
 | Platform | Languages | Module System |
 |----------|-----------|---------------|
-| Android | Kotlin, Java | Gradle (build.gradle.kts) |
+| Android/Java | Kotlin, Java | Gradle (build.gradle.kts), Maven (pom.xml) |
 | iOS | Swift, Objective-C | SPM (Package.swift) |
 | Web | TypeScript, JavaScript, React, Vue, Svelte | package.json |
 | Rust | Rust | Cargo.toml |
@@ -90,6 +90,9 @@ ast-index search "Payment"           # Finds files, classes, functions matching 
 ast-index search "ViewModel"         # Returns files, symbols, modules in ranked order
 ast-index search "Store" --fuzzy     # Fuzzy: exact → prefix → contains matching
 ast-index search "Handler" --module "core/"  # Search within a module
+ast-index search "UserService"       # Find Java/Spring services
+ast-index search "@RestController"   # Find Spring REST controllers (annotation search)
+ast-index search "@GetMapping"       # Find GET endpoint mappings
 ```
 
 ### File Search
@@ -108,8 +111,9 @@ ast-index file "ViewController"      # Find iOS view controllers
 ```bash
 ast-index symbol "PaymentInteractor" # Find exact symbol
 ast-index symbol "Presenter"         # Find all presenters
-ast-index symbol "Store" --fuzzy     # Fuzzy: exact → prefix (Store*) → contains (*Store*)
+ast-index symbol "Store" --fuzzy     # Fuzzy: exact → prefix → contains matching
 ast-index symbol "Mapper" --in-file "payments/" --limit 10  # Scoped search
+ast-index symbol "@Service"          # Find all @Service annotations
 ```
 
 ### Class Search
@@ -121,6 +125,7 @@ ast-index class "BaseFragment"       # Find Android base fragment
 ast-index class "UIViewController"   # Find iOS view controller subclass
 ast-index class "Store" --fuzzy      # Find all classes containing "Store"
 ast-index class "Repository" --module "features/payments"  # Filter by module
+ast-index class "UserController"     # Find Java/Spring controller class
 ```
 
 ### Usage Search
@@ -174,10 +179,11 @@ ast-index callers "fetchUser"        # Find API call sites
 
 ### Call Tree
 
-**`call-tree`** - Show complete call hierarchy going UP (who calls the callers).
+**`call-tree`** - Show complete call hierarchy going UP (who calls the callers). Supports Kotlin, Java, Swift, Perl, ObjC.
 
 ```bash
 ast-index call-tree "processPayment" --depth 3 --limit 10
+ast-index call-tree "getUsers"       # Java: finds callers of getUsers() method
 ```
 
 ### File Analysis
@@ -291,7 +297,7 @@ Most search commands (`search`, `symbol`, `class`, `usages`, `implementations`) 
 | `--limit <N>` | Max results to return |
 | `--format json` | JSON output for structured processing |
 
-**When to use `--fuzzy`:** When you don't know the exact name. `ast-index class "Store" --fuzzy` finds `Store`, `StoreImpl`, `AppStore`, `DataStoreRepository`, etc.
+**When to use `--fuzzy`:** When you don't know the exact name. `ast-index class "Store" --fuzzy` finds `Store`, `StoreImpl`, `AppStore`, `DataStoreRepository`, etc. The `--fuzzy` flag performs three-stage matching: exact match first, then prefix match, then contains match.
 
 ## Index Management
 
@@ -359,9 +365,13 @@ ast-index install-claude-plugin      # Install Claude Code plugin to ~/.claude/p
 
 ## Platform-Specific Commands
 
-### Android/Kotlin/Java
+### Android/Kotlin/Java/Spring
 
 Consult: `references/android-commands.md`
+
+Java parser indexes: classes, interfaces, enums, methods, constructors, fields, and significant annotations (@RestController, @Service, @Repository, @Component, @Entity, @GetMapping, @PostMapping, @Autowired, @Override, @Transactional, @SpringBootApplication, @Test, @Inject, @Data, @Builder, etc.).
+
+Maven modules (pom.xml) are fully supported alongside Gradle modules.
 
 - **DI Commands**: `provides`, `inject`, `annotations`
 - **Compose Commands**: `composables`, `previews`

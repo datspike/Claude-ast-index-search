@@ -1,4 +1,4 @@
-# ast-index v3.17.5
+# ast-index v3.18.0
 
 Fast code search CLI for 15 programming languages. Native Rust implementation.
 
@@ -322,6 +322,12 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 ```
 
 ## Changelog
+
+### 3.18.0
+- **Dedicated Java parser** — Java files now use `tree-sitter-java` instead of being routed through the Kotlin parser; indexes classes, interfaces, enums, methods, constructors, fields, and Spring annotations (`@RestController`, `@Service`, `@GetMapping`, etc.)
+- **Maven module support** — `pom.xml` files are recognized as module descriptors; `<artifactId>` extracted as module name, `<dependency>` entries matched against local modules
+- **Improved call-tree for Java** — regex patterns now detect Java-style method definitions (`void methodName(`, `String methodName(`), `this.method()` and `super.method()` call patterns
+- **Updated skill documentation** — added Java/Spring examples, Maven support notes, removed incorrect wildcard syntax
 
 ### 3.17.5
 - **No marker files** — removed `.ast-index-root` marker; project root detected via existing index DB in cache (zero files in project directory)

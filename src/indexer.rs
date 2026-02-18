@@ -141,7 +141,8 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
     let has_gradle = root.join("settings.gradle.kts").exists()
         || root.join("settings.gradle").exists()
         || root.join("build.gradle.kts").exists()
-        || root.join("build.gradle").exists();
+        || root.join("build.gradle").exists()
+        || root.join("pom.xml").exists();
 
     let has_swift = root.join("Package.swift").exists()
         || fs::read_dir(root)
@@ -409,6 +410,7 @@ pub fn is_excluded_dir(entry: &ignore::DirEntry) -> bool {
 /// Module-related file names to collect during directory walk
 fn is_module_file(name: &str) -> bool {
     name == "build.gradle" || name == "build.gradle.kts" || name == "Package.swift" || name.ends_with(".pm")
+        || name == "pom.xml"
 }
 
 /// Result of the filesystem walk in index_directory.
@@ -936,21 +938,54 @@ pub fn index_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf
                     }
                 }
             }
+
+            // Maven modules (pom.xml)
+            if name_str == "pom.xml" {
+                if let Some(parent) = path.parent() {
+                    let module_path = parent
+                        .strip_prefix(root)
+                        .unwrap_or(parent)
+                        .to_string_lossy()
+                        .to_string();
+
+                    if let Ok(content) = fs::read_to_string(path) {
+                        static ARTIFACT_RE: LazyLock<Regex> = LazyLock::new(||
+                            Regex::new(r"<artifactId>\s*([^<]+?)\s*</artifactId>").unwrap()
+                        );
+                        let artifact_re = &*ARTIFACT_RE;
+                        if let Some(caps) = artifact_re.captures(&content) {
+                            let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                            if !artifact_id.is_empty() {
+                                let module_name = if module_path.is_empty() {
+                                    artifact_id.to_string()
+                                } else {
+                                    module_path.replace('/', ".")
+                                };
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO modules (name, path) VALUES (?1, ?2)",
+                                    rusqlite::params![module_name, module_path],
+                                )?;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
     Ok(count)
 }
 
-/// Collect build.gradle files from module paths in DB (for standalone rebuild modules/deps)
-pub fn collect_gradle_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
+/// Collect build files (Gradle, Maven) from module paths in DB (for standalone rebuild modules/deps)
+pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec<PathBuf>> {
     let mut stmt = conn.prepare("SELECT path FROM modules")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut files = Vec::new();
     for row in rows {
         let module_path = row?;
         let dir = root.join(&module_path);
-        for name in &["build.gradle.kts", "build.gradle"] {
+        for name in &["build.gradle.kts", "build.gradle", "pom.xml"] {
             let p = dir.join(name);
             if p.exists() {
                 files.push(p);
@@ -1004,6 +1039,12 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
             "INSERT OR IGNORE INTO module_deps (module_id, dep_module_id, dep_kind) VALUES (?1, ?2, ?3)"
         )?;
 
+        // Maven dependency regex: <dependency>...<artifactId>name</artifactId>...</dependency>
+        static MAVEN_DEP_RE: LazyLock<Regex> = LazyLock::new(||
+            Regex::new(r"(?s)<dependency>.*?<artifactId>\s*([^<]+?)\s*</artifactId>.*?</dependency>").unwrap()
+        );
+        let maven_dep_re = &*MAVEN_DEP_RE;
+
         for path in gradle_files {
             if let Some(parent) = path.parent() {
                 let module_path = parent
@@ -1014,30 +1055,49 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
                 let module_name = module_path.replace('/', ".");
 
                 if let Some(&module_id) = module_ids.get(&module_name) {
-                    // Read build.gradle content
+                    // Read build file content
                     if let Ok(content) = fs::read_to_string(path) {
-                        // Parse projects DSL style dependencies
-                        for caps in projects_dep_re.captures_iter(&content) {
-                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-                            if let Some(&dep_id) = module_ids.get(dep_name) {
-                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                dep_count += 1;
+                        if file_name == "pom.xml" {
+                            // Maven dependencies
+                            for caps in maven_dep_re.captures_iter(&content) {
+                                let artifact_id = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                                // Check if this artifactId matches a known module
+                                for (mod_name, &mod_id) in &module_ids {
+                                    // Match by last segment (artifactId typically matches the module name)
+                                    let last_segment = mod_name.rsplit('.').next().unwrap_or(mod_name);
+                                    if last_segment == artifact_id {
+                                        dep_stmt.execute(rusqlite::params![module_id, mod_id, "compile"])?;
+                                        dep_count += 1;
+                                    }
+                                }
                             }
-                        }
+                        } else {
+                            // Gradle dependencies
+                            // Parse projects DSL style dependencies
+                            for caps in projects_dep_re.captures_iter(&content) {
+                                let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                                let dep_name = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-                        // Parse standard Gradle style dependencies
-                        for caps in gradle_project_re.captures_iter(&content) {
-                            let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
-                            let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                                if let Some(&dep_id) = module_ids.get(dep_name) {
+                                    dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                    dep_count += 1;
+                                }
+                            }
 
-                            // Convert :features:payments:api to features.payments.api
-                            let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+                            // Parse standard Gradle style dependencies
+                            for caps in gradle_project_re.captures_iter(&content) {
+                                let dep_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("implementation");
+                                let dep_path = caps.get(2).map(|m| m.as_str()).unwrap_or("");
 
-                            if let Some(&dep_id) = module_ids.get(&dep_name) {
-                                dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
-                                dep_count += 1;
+                                // Convert :features:payments:api to features.payments.api
+                                let dep_name = dep_path.trim_start_matches(':').replace(':', ".");
+
+                                if let Some(&dep_id) = module_ids.get(&dep_name) {
+                                    dep_stmt.execute(rusqlite::params![module_id, dep_id, dep_kind])?;
+                                    dep_count += 1;
+                                }
                             }
                         }
                     }

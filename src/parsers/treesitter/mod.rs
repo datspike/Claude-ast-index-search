@@ -7,6 +7,7 @@ pub mod cpp;
 pub mod csharp;
 pub mod dart;
 pub mod go;
+pub mod java;
 pub mod kotlin;
 pub mod objc;
 pub mod proto;
@@ -41,6 +42,7 @@ pub fn get_treesitter_parser(file_type: FileType) -> Option<&'static dyn Languag
         FileType::CSharp => Some(&csharp::CSHARP_PARSER),
         FileType::Dart => Some(&dart::DART_PARSER),
         FileType::Go => Some(&go::GO_PARSER),
+        FileType::Java => Some(&java::JAVA_PARSER),
         FileType::Kotlin => Some(&kotlin::KOTLIN_PARSER),
         FileType::ObjC => Some(&objc::OBJC_PARSER),
         FileType::Proto => Some(&proto::PROTO_PARSER),

@@ -343,6 +343,7 @@ pub use wsdl::parse_wsdl_symbols;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileType {
     Kotlin,
+    Java,
     Swift,
     ObjC,
     Perl,
@@ -365,7 +366,8 @@ impl FileType {
     /// Determine file type from extension, returns None for unsupported extensions
     pub fn from_extension(ext: &str) -> Option<FileType> {
         match ext {
-            "kt" | "java" => Some(FileType::Kotlin),
+            "kt" => Some(FileType::Kotlin),
+            "java" => Some(FileType::Java),
             "swift" => Some(FileType::Swift),
             "m" => Some(FileType::ObjC),
             "h" => Some(FileType::Cpp), // .h can be ObjC or C++, default to C++
@@ -397,7 +399,7 @@ pub fn is_supported_extension(ext: &str) -> bool {
 fn strip_comments(content: &str, file_type: FileType) -> String {
     match file_type {
         // C-style comments (no nesting)
-        FileType::Kotlin | FileType::ObjC | FileType::Go |
+        FileType::Kotlin | FileType::Java | FileType::ObjC | FileType::Go |
         FileType::CSharp | FileType::Proto | FileType::TypeScript |
         FileType::Dart | FileType::Cpp | FileType::Scala => strip_c_comments(content, false),
         // C-style comments with nesting support
@@ -768,7 +770,7 @@ mod tests {
     #[test]
     fn test_file_type_from_extension() {
         assert_eq!(FileType::from_extension("kt"), Some(FileType::Kotlin));
-        assert_eq!(FileType::from_extension("java"), Some(FileType::Kotlin));
+        assert_eq!(FileType::from_extension("java"), Some(FileType::Java));
         assert_eq!(FileType::from_extension("swift"), Some(FileType::Swift));
         assert_eq!(FileType::from_extension("m"), Some(FileType::ObjC));
         assert_eq!(FileType::from_extension("py"), Some(FileType::Python));

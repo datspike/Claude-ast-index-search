@@ -81,10 +81,16 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 /// Find function callers
 pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()> {
     let start = Instant::now();
-    // Pattern for function calls: obj.func(), ->func(), func()
-    let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(|->{function_name}\s*\(|&{function_name}\s*\(");
+    // Pattern for function calls: obj.func(), ->func(), func(), this.func(), super.func()
+    let pattern = format!(
+        r"[.>]{fn_name}\s*\(|^\s*{fn_name}\s*\(|->{fn_name}\s*\(|&{fn_name}\s*\(|this\.{fn_name}\s*\(|super\.{fn_name}\s*\(",
+        fn_name = function_name
+    );
     // Skip definitions in Kotlin/Java/Swift/Perl
-    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open|sub)\s+{function_name}\s*[<({{\[]"))?;
+    let def_pattern = Regex::new(&format!(
+        r"\b(?:fun|func|def|sub)\s+{fn}\s*[<({{\[]|\b(?:void|int|long|boolean|char|byte|short|float|double|String|Object|List|Map|Set|Optional|CompletableFuture|\w+(?:<[^>]*>)?)\s+{fn}\s*\(",
+        fn = function_name
+    ))?;
 
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut count = 0;
@@ -166,11 +172,20 @@ fn build_call_tree(
 
 /// Find functions that call the given function
 fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Result<Vec<(String, String, usize)>> {
-    let pattern = format!(r"[.>]{function_name}\s*\(|^\s*{function_name}\s*\(|->{function_name}\s*\(|&{function_name}\s*\(");
-    let def_pattern = Regex::new(&format!(r"\b(fun|func|def|void|private|public|protected|override|internal|fileprivate|open|sub)\s+{function_name}\s*[<({{\[]"))?;
+    let pattern = format!(
+        r"[.>]{fn_name}\s*\(|^\s*{fn_name}\s*\(|->{fn_name}\s*\(|&{fn_name}\s*\(|this\.{fn_name}\s*\(|super\.{fn_name}\s*\(",
+        fn_name = function_name
+    );
+    let def_pattern = Regex::new(&format!(
+        r"\b(?:fun|func|def|sub)\s+{fn}\s*[<({{\[]|\b(?:void|int|long|boolean|char|byte|short|float|double|String|Object|List|Map|Set|Optional|CompletableFuture|\w+(?:<[^>]*>)?)\s+{fn}\s*\(",
+        fn = function_name
+    ))?;
 
-    // Pattern to find function definitions
-    let func_def_re = Regex::new(r"(?:fun|func|def|void|private|public|protected|override|internal|open|sub)\s+(\w+)\s*[<(\[]")?;
+    // Pattern to find function definitions (for locating the containing function)
+    // Group 1: fun/func/def/sub style, Group 2: Java return-type style
+    let func_def_re = Regex::new(
+        r"(?:fun|func|def|sub)\s+(\w+)\s*[<(\[]|(?:void|int|long|boolean|char|byte|short|float|double|String|Object|\w+(?:<[^>]*>)?)\s+(\w+)\s*\("
+    )?;
 
     let mut results: Vec<(String, String, usize)> = vec![];
     let mut files_with_calls: HashMap<PathBuf, Vec<usize>> = HashMap::new();
@@ -218,7 +233,8 @@ fn find_containing_function(lines: &[&str], target_line: usize, func_def_re: &Re
     for i in (0..=start_idx).rev() {
         let line = lines[i];
         if let Some(caps) = func_def_re.captures(line) {
-            if let Some(name) = caps.get(1) {
+            // Group 1: fun/func/def/sub style, Group 2: Java return-type style
+            if let Some(name) = caps.get(1).or_else(|| caps.get(2)) {
                 return Some((name.as_str().to_string(), i + 1));
             }
         }
