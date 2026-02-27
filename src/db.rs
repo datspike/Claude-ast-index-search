@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 /// Get the database path for the current project
 pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
     // Check env: new name first, fallback to old
-    if let Ok(path) = std::env::var("AST_INDEX_DB_PATH")
-        .or_else(|_| std::env::var("KOTLIN_INDEX_DB_PATH"))
+    if let Ok(path) =
+        std::env::var("AST_INDEX_DB_PATH").or_else(|_| std::env::var("KOTLIN_INDEX_DB_PATH"))
     {
         return Ok(PathBuf::from(path));
     }
@@ -28,7 +28,10 @@ pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
         if let Ok(entries) = std::fs::read_dir(&cache_dir) {
             for entry in entries.flatten() {
                 let old_dir = entry.path();
-                if old_dir.is_dir() && old_dir.file_name().map(|n| n.to_string_lossy().to_string()) != Some(project_hash.clone()) {
+                if old_dir.is_dir()
+                    && old_dir.file_name().map(|n| n.to_string_lossy().to_string())
+                        != Some(project_hash.clone())
+                {
                     let old_db = old_dir.join("index.db");
                     if old_db.exists() {
                         // Check if this DB belongs to our project by reading metadata
@@ -325,6 +328,71 @@ pub fn init_db(conn: &Connection) -> Result<()> {
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
         );
+
+        -- Python endpoints (Django urlpatterns, DRF router)
+        CREATE TABLE IF NOT EXISTS py_endpoints (
+            id INTEGER PRIMARY KEY,
+            method TEXT,
+            path_pattern TEXT NOT NULL,
+            file_id INTEGER NOT NULL,
+            line INTEGER NOT NULL,
+            handler_qname TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_py_endpoints_file ON py_endpoints(file_id);
+        CREATE INDEX IF NOT EXISTS idx_py_endpoints_path ON py_endpoints(path_pattern);
+
+        -- Python endpoint -> handler symbol links
+        CREATE TABLE IF NOT EXISTS py_endpoint_handlers (
+            id INTEGER PRIMARY KEY,
+            endpoint_id INTEGER NOT NULL,
+            symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'high',
+            reason TEXT,
+            FOREIGN KEY(endpoint_id) REFERENCES py_endpoints(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_py_endpoint_handlers_endpoint ON py_endpoint_handlers(endpoint_id);
+        CREATE INDEX IF NOT EXISTS idx_py_endpoint_handlers_symbol ON py_endpoint_handlers(symbol_id);
+
+        -- Python serializer -> model links
+        CREATE TABLE IF NOT EXISTS py_serializer_models (
+            id INTEGER PRIMARY KEY,
+            serializer_symbol_id INTEGER NOT NULL,
+            model_symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'high',
+            reason TEXT,
+            FOREIGN KEY(serializer_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(model_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_py_serializer_models_serializer ON py_serializer_models(serializer_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_py_serializer_models_model ON py_serializer_models(model_symbol_id);
+
+        -- Python symbol -> settings/env key links
+        CREATE TABLE IF NOT EXISTS py_symbol_settings (
+            id INTEGER PRIMARY KEY,
+            symbol_id INTEGER NOT NULL,
+            key TEXT NOT NULL,
+            key_kind TEXT NOT NULL DEFAULT 'settings',
+            confidence TEXT NOT NULL DEFAULT 'medium',
+            reason TEXT,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_py_symbol_settings_symbol ON py_symbol_settings(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_py_symbol_settings_key ON py_symbol_settings(key);
+
+        -- Python handler -> serializer direct links (serializer_class = X)
+        CREATE TABLE IF NOT EXISTS py_handler_serializers (
+            id INTEGER PRIMARY KEY,
+            handler_symbol_id INTEGER NOT NULL,
+            serializer_symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'high',
+            reason TEXT,
+            FOREIGN KEY(handler_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(serializer_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS idx_py_handler_serializers_handler ON py_handler_serializers(handler_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_py_handler_serializers_serializer ON py_handler_serializers(serializer_symbol_id);
         "#,
     )?;
     Ok(())
@@ -347,11 +415,13 @@ pub fn open_db(project_root: &Path) -> Result<Connection> {
     conn.execute(
         "CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
         [],
-    ).ok();
+    )
+    .ok();
     conn.execute(
         "INSERT OR REPLACE INTO metadata (key, value) VALUES ('project_root', ?1)",
         params![project_root.to_string_lossy().as_ref()],
-    ).ok();
+    )
+    .ok();
 
     Ok(conn)
 }
@@ -519,9 +589,7 @@ pub struct SearchResult {
 
 /// Find files by name pattern
 pub fn find_files(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(
-        "SELECT path FROM files WHERE path LIKE ?1 LIMIT ?2",
-    )?;
+    let mut stmt = conn.prepare("SELECT path FROM files WHERE path LIKE ?1 LIMIT ?2")?;
 
     let pattern = format!("%{}%", pattern);
     let results = stmt
@@ -637,11 +705,7 @@ pub fn find_symbols_by_name(
 }
 
 /// Find class-like symbols (class, interface, object, enum) by name - single query
-pub fn find_class_like(
-    conn: &Connection,
-    name: &str,
-    limit: usize,
-) -> Result<Vec<SearchResult>> {
+pub fn find_class_like(conn: &Connection, name: &str, limit: usize) -> Result<Vec<SearchResult>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT s.name, s.kind, s.line, s.signature, f.path
@@ -713,11 +777,23 @@ pub fn get_stats(conn: &Connection) -> Result<DbStats> {
     let file_count: i64 = conn.query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
     let symbol_count: i64 = conn.query_row("SELECT COUNT(*) FROM symbols", [], |row| row.get(0))?;
     let module_count: i64 = conn.query_row("SELECT COUNT(*) FROM modules", [], |row| row.get(0))?;
-    let refs_count: i64 = conn.query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0)).unwrap_or(0);
-    let xml_usages_count: i64 = conn.query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0)).unwrap_or(0);
-    let resources_count: i64 = conn.query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0)).unwrap_or(0);
-    let storyboard_usages_count: i64 = conn.query_row("SELECT COUNT(*) FROM storyboard_usages", [], |row| row.get(0)).unwrap_or(0);
-    let ios_assets_count: i64 = conn.query_row("SELECT COUNT(*) FROM ios_assets", [], |row| row.get(0)).unwrap_or(0);
+    let refs_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM refs", [], |row| row.get(0))
+        .unwrap_or(0);
+    let xml_usages_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM xml_usages", [], |row| row.get(0))
+        .unwrap_or(0);
+    let resources_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM resources", [], |row| row.get(0))
+        .unwrap_or(0);
+    let storyboard_usages_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM storyboard_usages", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0);
+    let ios_assets_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ios_assets", [], |row| row.get(0))
+        .unwrap_or(0);
 
     Ok(DbStats {
         file_count,
@@ -747,6 +823,11 @@ pub struct DbStats {
 pub fn clear_db(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         r#"
+        DELETE FROM py_symbol_settings;
+        DELETE FROM py_handler_serializers;
+        DELETE FROM py_serializer_models;
+        DELETE FROM py_endpoint_handlers;
+        DELETE FROM py_endpoints;
         DELETE FROM ios_asset_usages;
         DELETE FROM ios_assets;
         DELETE FROM storyboard_usages;
@@ -765,6 +846,47 @@ pub fn clear_db(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Clear Python-specific tables by file_id (for incremental reindex)
+pub fn clear_py_facts_for_files(conn: &Connection, file_ids: &[i64]) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
+    let ph = placeholders.join(",");
+
+    // py_endpoints are linked directly to file_id
+    let sql = format!("DELETE FROM py_endpoints WHERE file_id IN ({})", ph);
+    let params: Vec<Box<dyn rusqlite::types::ToSql>> = file_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    conn.execute(&sql, param_refs.as_slice())?;
+
+    // py_symbol_settings are linked via symbol_id -> symbols.file_id
+    let sql = format!(
+        "DELETE FROM py_symbol_settings WHERE symbol_id IN (SELECT id FROM symbols WHERE file_id IN ({}))",
+        ph
+    );
+    conn.execute(&sql, param_refs.as_slice())?;
+
+    // py_serializer_models are linked via serializer_symbol_id -> symbols.file_id
+    let sql = format!(
+        "DELETE FROM py_serializer_models WHERE serializer_symbol_id IN (SELECT id FROM symbols WHERE file_id IN ({}))",
+        ph
+    );
+    conn.execute(&sql, param_refs.as_slice())?;
+
+    // py_handler_serializers linked through handler_symbol_id -> symbols.file_id
+    let sql = format!(
+        "DELETE FROM py_handler_serializers WHERE handler_symbol_id IN (SELECT id FROM symbols WHERE file_id IN ({}))",
+        ph
+    );
+    conn.execute(&sql, param_refs.as_slice())?;
+
+    Ok(())
+}
+
 /// Reference result
 #[derive(Debug, Serialize)]
 pub struct RefResult {
@@ -775,11 +897,7 @@ pub struct RefResult {
 }
 
 /// Find references (usages) of a symbol
-pub fn find_references(
-    conn: &Connection,
-    name: &str,
-    limit: usize,
-) -> Result<Vec<RefResult>> {
+pub fn find_references(conn: &Connection, name: &str, limit: usize) -> Result<Vec<RefResult>> {
     let mut stmt = conn.prepare(
         r#"
         SELECT r.name, r.line, r.context, f.path
@@ -909,15 +1027,18 @@ pub fn search_symbols_fuzzy(
     )?;
     let prefix_pattern = format!("{}%", query);
     let results: Vec<SearchResult> = stmt
-        .query_map(params![contains_pattern, query, prefix_pattern, limit as i64], |row| {
-            Ok(SearchResult {
-                name: row.get(0)?,
-                kind: row.get(1)?,
-                line: row.get(2)?,
-                signature: row.get(3)?,
-                path: row.get(4)?,
-            })
-        })?
+        .query_map(
+            params![contains_pattern, query, prefix_pattern, limit as i64],
+            |row| {
+                Ok(SearchResult {
+                    name: row.get(0)?,
+                    kind: row.get(1)?,
+                    line: row.get(2)?,
+                    signature: row.get(3)?,
+                    path: row.get(4)?,
+                })
+            },
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(results)
@@ -1003,7 +1124,8 @@ pub fn search_symbols_scoped(
     }
     all_params.push(Box::new(limit as i64));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(SearchResult {
@@ -1055,7 +1177,8 @@ pub fn find_symbols_by_name_scoped(
     }
     all_params.push(Box::new(limit as i64));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(SearchResult {
@@ -1104,7 +1227,8 @@ pub fn find_class_like_scoped(
     }
     all_params.push(Box::new(limit as i64));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(SearchResult {
@@ -1154,7 +1278,8 @@ pub fn find_references_scoped(
     }
     all_params.push(Box::new(limit as i64));
 
-    let param_refs: Vec<&dyn rusqlite::types::ToSql> = all_params.iter().map(|p| p.as_ref()).collect();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        all_params.iter().map(|p| p.as_ref()).collect();
     let results = stmt
         .query_map(param_refs.as_slice(), |row| {
             Ok(RefResult {
@@ -1215,6 +1340,598 @@ pub fn remove_extra_root(conn: &Connection, path: &str) -> Result<bool> {
     Ok(true)
 }
 
+// === Python graph query API ===
+
+/// Result row for py.routes query
+#[derive(Debug, Serialize)]
+pub struct PyEndpointResult {
+    pub id: i64,
+    pub method: Option<String>,
+    pub path_pattern: String,
+    pub file_path: String,
+    pub line: i64,
+    pub handler_qname: Option<String>,
+    pub confidence: Option<String>,
+}
+
+/// Result for py.endpoint-trace (endpoint -> handler -> serializer -> model)
+#[derive(Debug, Serialize)]
+pub struct PyEndpointTrace {
+    pub endpoint: PyEndpointResult,
+    pub handler: Option<SearchResult>,
+    pub serializer: Option<SearchResult>,
+    pub model: Option<SearchResult>,
+    pub settings: Vec<PySettingUsage>,
+}
+
+/// Result row for py.setting-usage query
+#[derive(Debug, Serialize)]
+pub struct PySettingUsage {
+    pub key: String,
+    pub key_kind: String,
+    pub symbol_name: String,
+    pub file_path: String,
+    pub line: i64,
+    pub confidence: String,
+    pub reason: Option<String>,
+    /// Symbol ID for linking queries (not serialized to JSON)
+    #[serde(skip)]
+    pub symbol_id: i64,
+}
+
+/// Insert a Python endpoint
+pub fn insert_py_endpoint(
+    conn: &Connection,
+    method: Option<&str>,
+    path_pattern: &str,
+    file_id: i64,
+    line: usize,
+    handler_qname: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO py_endpoints (method, path_pattern, file_id, line, handler_qname) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![method, path_pattern, file_id, line as i64, handler_qname],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Insert endpoint -> handler symbol link
+pub fn insert_py_endpoint_handler(
+    conn: &Connection,
+    endpoint_id: i64,
+    symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO py_endpoint_handlers (endpoint_id, symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![endpoint_id, symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert serializer -> model link
+pub fn insert_py_serializer_model(
+    conn: &Connection,
+    serializer_symbol_id: i64,
+    model_symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO py_serializer_models (serializer_symbol_id, model_symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![serializer_symbol_id, model_symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert symbol -> settings key link
+pub fn insert_py_symbol_setting(
+    conn: &Connection,
+    symbol_id: i64,
+    key: &str,
+    key_kind: &str,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO py_symbol_settings (symbol_id, key, key_kind, confidence, reason) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![symbol_id, key, key_kind, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert handler -> serializer direct link
+pub fn insert_py_handler_serializer(
+    conn: &Connection,
+    handler_symbol_id: i64,
+    serializer_symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO py_handler_serializers (handler_symbol_id, serializer_symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![handler_symbol_id, serializer_symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Get serializer linked to handler via py_handler_serializers
+pub fn get_py_handler_serializer(
+    conn: &Connection,
+    handler_symbol_id: i64,
+) -> Result<Option<(i64, SearchResult, String)>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, hs.confidence
+        FROM py_handler_serializers hs
+        JOIN symbols s ON hs.serializer_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE hs.handler_symbol_id = ?1
+        ORDER BY CASE hs.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END
+        LIMIT 1
+        "#,
+        params![handler_symbol_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                },
+                row.get::<_, String>(6)?,
+            ))
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Count Python endpoints with optional filter
+pub fn count_py_endpoints(conn: &Connection, query: Option<&str>) -> Result<usize> {
+    let count: i64 = if let Some(q) = query {
+        let pattern = format!("%{}%", q.to_lowercase());
+        conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM py_endpoints e
+            WHERE LOWER(e.path_pattern) LIKE ?1
+               OR LOWER(COALESCE(e.handler_qname, '')) LIKE ?1
+            "#,
+            params![pattern],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row("SELECT COUNT(*) FROM py_endpoints", [], |row| row.get(0))?
+    };
+    Ok(count as usize)
+}
+
+/// Get Python endpoints with limit and optional filter (for py.routes)
+pub fn get_py_endpoints(
+    conn: &Connection,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<Vec<PyEndpointResult>> {
+    let pattern = query.map(|q| format!("%{}%", q.to_lowercase()));
+
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<PyEndpointResult> {
+        Ok(PyEndpointResult {
+            id: row.get(0)?,
+            method: row.get(1)?,
+            path_pattern: row.get(2)?,
+            file_path: row.get(3)?,
+            line: row.get(4)?,
+            handler_qname: row.get(5)?,
+            confidence: row.get(6)?,
+        })
+    };
+
+    let results = if let Some(ref pat) = pattern {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, e.line, e.handler_qname,
+                   h.confidence
+            FROM py_endpoints e
+            JOIN files f ON e.file_id = f.id
+            LEFT JOIN py_endpoint_handlers h ON h.endpoint_id = e.id
+            WHERE LOWER(e.path_pattern) LIKE ?1
+               OR LOWER(COALESCE(e.handler_qname, '')) LIKE ?1
+            ORDER BY e.path_pattern, e.method
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![pat, limit as i64], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, e.line, e.handler_qname,
+                   h.confidence
+            FROM py_endpoints e
+            JOIN files f ON e.file_id = f.id
+            LEFT JOIN py_endpoint_handlers h ON h.endpoint_id = e.id
+            ORDER BY e.path_pattern, e.method
+            LIMIT ?1
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![limit as i64], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    Ok(results)
+}
+
+/// Find endpoint by method + path pattern (for py.endpoint-trace)
+pub fn find_py_endpoint(
+    conn: &Connection,
+    method: Option<&str>,
+    path_pattern: &str,
+) -> Result<Vec<PyEndpointResult>> {
+    let (sql, use_method) = if method.is_some() {
+        (
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, e.line, e.handler_qname,
+                   h.confidence
+            FROM py_endpoints e
+            JOIN files f ON e.file_id = f.id
+            LEFT JOIN py_endpoint_handlers h ON h.endpoint_id = e.id
+            WHERE e.method = ?1 AND e.path_pattern LIKE ?2
+            ORDER BY e.path_pattern
+            "#,
+            true,
+        )
+    } else {
+        (
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, e.line, e.handler_qname,
+                   h.confidence
+            FROM py_endpoints e
+            JOIN files f ON e.file_id = f.id
+            LEFT JOIN py_endpoint_handlers h ON h.endpoint_id = e.id
+            WHERE e.path_pattern LIKE ?1
+            ORDER BY e.path_pattern
+            "#,
+            false,
+        )
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let pattern = format!("%{}%", path_pattern);
+
+    let results = if use_method {
+        stmt.query_map(params![method.unwrap(), pattern], |row| {
+            Ok(PyEndpointResult {
+                id: row.get(0)?,
+                method: row.get(1)?,
+                path_pattern: row.get(2)?,
+                file_path: row.get(3)?,
+                line: row.get(4)?,
+                handler_qname: row.get(5)?,
+                confidence: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![pattern], |row| {
+            Ok(PyEndpointResult {
+                id: row.get(0)?,
+                method: row.get(1)?,
+                path_pattern: row.get(2)?,
+                file_path: row.get(3)?,
+                line: row.get(4)?,
+                handler_qname: row.get(5)?,
+                confidence: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(results)
+}
+
+/// Get handler symbol for an endpoint
+pub fn get_py_endpoint_handler(
+    conn: &Connection,
+    endpoint_id: i64,
+) -> Result<Option<SearchResult>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path
+        FROM py_endpoint_handlers eh
+        JOIN symbols s ON eh.symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE eh.endpoint_id = ?1
+        LIMIT 1
+        "#,
+        params![endpoint_id],
+        |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get linked serializer -> model for a symbol_id
+pub fn get_py_serializer_model(conn: &Connection, symbol_id: i64) -> Result<Option<SearchResult>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path
+        FROM py_serializer_models sm
+        JOIN symbols s ON sm.model_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE sm.serializer_symbol_id = ?1
+        LIMIT 1
+        "#,
+        params![symbol_id],
+        |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+            })
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Find settings/env key usages (for py.setting-usage)
+pub fn find_py_setting_usages(
+    conn: &Connection,
+    key: &str,
+    limit: usize,
+) -> Result<Vec<PySettingUsage>> {
+    let pattern = format!("%{}%", key);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT ps.key, ps.key_kind, s.name, f.path, s.line, ps.confidence, ps.reason, s.id
+        FROM py_symbol_settings ps
+        JOIN symbols s ON ps.symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE ps.key LIKE ?1
+        ORDER BY ps.key, f.path, s.line
+        LIMIT ?2
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![pattern, limit as i64], |row| {
+            Ok(PySettingUsage {
+                key: row.get(0)?,
+                key_kind: row.get(1)?,
+                symbol_name: row.get(2)?,
+                file_path: row.get(3)?,
+                line: row.get(4)?,
+                confidence: row.get(5)?,
+                reason: row.get(6)?,
+                symbol_id: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Get settings for a symbol_id (for endpoint-trace)
+pub fn get_py_symbol_settings(conn: &Connection, symbol_id: i64) -> Result<Vec<PySettingUsage>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT ps.key, ps.key_kind, s.name, f.path, s.line, ps.confidence, ps.reason, s.id
+        FROM py_symbol_settings ps
+        JOIN symbols s ON ps.symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE ps.symbol_id = ?1
+        ORDER BY ps.key
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![symbol_id], |row| {
+            Ok(PySettingUsage {
+                key: row.get(0)?,
+                key_kind: row.get(1)?,
+                symbol_name: row.get(2)?,
+                file_path: row.get(3)?,
+                line: row.get(4)?,
+                confidence: row.get(5)?,
+                reason: row.get(6)?,
+                symbol_id: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+// === py.model-impact query API ===
+
+/// Result for py.model-impact: model -> serializers -> handlers -> endpoints
+#[derive(Debug, Serialize)]
+pub struct PyModelImpact {
+    pub model: SearchResult,
+    pub serializers: Vec<PyModelSerializerImpact>,
+}
+
+/// Serializer impact entry for model-impact
+#[derive(Debug, Serialize)]
+pub struct PyModelSerializerImpact {
+    pub serializer: SearchResult,
+    pub confidence: String,
+    pub handlers: Vec<PyModelHandlerImpact>,
+}
+
+/// Handler + endpoints for model-impact
+#[derive(Debug, Serialize)]
+pub struct PyModelHandlerImpact {
+    pub handler: SearchResult,
+    pub endpoints: Vec<PyEndpointResult>,
+}
+
+/// Find model symbols by name (prefer models.py files)
+pub fn find_py_model_symbols(
+    conn: &Connection,
+    name: &str,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE s.name = ?1 AND s.kind = 'class'
+        ORDER BY
+            CASE WHEN f.path LIKE '%models.py' OR f.path LIKE '%models/%' THEN 0 ELSE 1 END,
+            f.path
+        LIMIT ?2
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![name, limit as i64], |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find serializers linked to a model symbol (via py_serializer_models)
+pub fn find_py_serializers_for_model(
+    conn: &Connection,
+    model_name: &str,
+) -> Result<Vec<(i64, SearchResult, String)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, sm.confidence
+        FROM py_serializer_models sm
+        JOIN symbols model_s ON sm.model_symbol_id = model_s.id
+        JOIN symbols s ON sm.serializer_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE model_s.name = ?1
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![model_name], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                },
+                row.get::<_, String>(6)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find handlers linked to a serializer (via py_handler_serializers)
+pub fn find_py_handlers_for_serializer(
+    conn: &Connection,
+    serializer_symbol_id: i64,
+) -> Result<Vec<(i64, SearchResult)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path
+        FROM py_handler_serializers hs
+        JOIN symbols s ON hs.handler_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE hs.serializer_symbol_id = ?1
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![serializer_symbol_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find endpoints linked to a handler (via py_endpoint_handlers)
+pub fn find_py_endpoints_for_handler(
+    conn: &Connection,
+    handler_symbol_id: i64,
+) -> Result<Vec<PyEndpointResult>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.id, e.method, e.path_pattern, f.path, e.line, e.handler_qname, eh.confidence
+        FROM py_endpoint_handlers eh
+        JOIN py_endpoints e ON eh.endpoint_id = e.id
+        JOIN files f ON e.file_id = f.id
+        WHERE eh.symbol_id = ?1
+        ORDER BY e.path_pattern, e.method
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![handler_symbol_id], |row| {
+            Ok(PyEndpointResult {
+                id: row.get(0)?,
+                method: row.get(1)?,
+                path_pattern: row.get(2)?,
+                file_path: row.get(3)?,
+                line: row.get(4)?,
+                handler_qname: row.get(5)?,
+                confidence: row.get(6)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,10 +1960,13 @@ mod tests {
     fn test_init_db() {
         let conn = create_test_db();
         // Check tables exist
-        let count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
-            [], |row| row.get(0)
-        ).unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -1278,8 +1998,24 @@ mod tests {
         let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
         assert!(file_id > 0);
 
-        insert_symbol(&conn, file_id, "MyService", SymbolKind::Class, 10, Some("class MyService")).unwrap();
-        insert_symbol(&conn, file_id, "processData", SymbolKind::Function, 20, Some("fun processData()")).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "MyService",
+            SymbolKind::Class,
+            10,
+            Some("class MyService"),
+        )
+        .unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "processData",
+            SymbolKind::Function,
+            20,
+            Some("fun processData()"),
+        )
+        .unwrap();
 
         let results = search_symbols(&conn, "MyService", 10).unwrap();
         assert_eq!(results.len(), 1);
@@ -1310,8 +2046,24 @@ mod tests {
     fn test_find_symbols_by_name() {
         let conn = create_test_db();
         let file_id = upsert_file(&conn, "src/model.kt", 1000, 100).unwrap();
-        insert_symbol(&conn, file_id, "User", SymbolKind::Class, 5, Some("data class User")).unwrap();
-        insert_symbol(&conn, file_id, "UserRepository", SymbolKind::Interface, 20, Some("interface UserRepository")).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "User",
+            SymbolKind::Class,
+            5,
+            Some("data class User"),
+        )
+        .unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "UserRepository",
+            SymbolKind::Interface,
+            20,
+            Some("interface UserRepository"),
+        )
+        .unwrap();
 
         let results = find_symbols_by_name(&conn, "User", None, 10).unwrap();
         assert!(results.len() >= 1);
@@ -1323,14 +2075,25 @@ mod tests {
         let conn = create_test_db();
         let _id1 = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
         let id2 = upsert_file(&conn, "src/main.kt", 2000, 200).unwrap();
-        assert!(id2 > 0, "upsert should succeed for same path with different mtime");
+        assert!(
+            id2 > 0,
+            "upsert should succeed for same path with different mtime"
+        );
     }
 
     #[test]
     fn test_clear_db() {
         let conn = create_test_db();
         let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
-        insert_symbol(&conn, file_id, "Test", SymbolKind::Class, 1, Some("class Test")).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "Test",
+            SymbolKind::Class,
+            1,
+            Some("class Test"),
+        )
+        .unwrap();
 
         clear_db(&conn).unwrap();
 
@@ -1342,8 +2105,24 @@ mod tests {
     fn test_get_stats() {
         let conn = create_test_db();
         let file_id = upsert_file(&conn, "src/main.kt", 1000, 100).unwrap();
-        insert_symbol(&conn, file_id, "Foo", SymbolKind::Class, 1, Some("class Foo")).unwrap();
-        insert_symbol(&conn, file_id, "bar", SymbolKind::Function, 5, Some("fun bar()")).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "Foo",
+            SymbolKind::Class,
+            1,
+            Some("class Foo"),
+        )
+        .unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "bar",
+            SymbolKind::Function,
+            5,
+            Some("fun bar()"),
+        )
+        .unwrap();
 
         let stats = get_stats(&conn).unwrap();
         assert_eq!(stats.file_count, 1);
@@ -1354,11 +2133,21 @@ mod tests {
     fn test_insert_and_find_inheritance() {
         let conn = create_test_db();
         let file_id = upsert_file(&conn, "src/model.kt", 1000, 100).unwrap();
-        insert_symbol(&conn, file_id, "Child", SymbolKind::Class, 1, Some("class Child : Parent()")).unwrap();
+        insert_symbol(
+            &conn,
+            file_id,
+            "Child",
+            SymbolKind::Class,
+            1,
+            Some("class Child : Parent()"),
+        )
+        .unwrap();
 
-        let child_id: i64 = conn.query_row(
-            "SELECT id FROM symbols WHERE name = 'Child'", [], |row| row.get(0)
-        ).unwrap();
+        let child_id: i64 = conn
+            .query_row("SELECT id FROM symbols WHERE name = 'Child'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
         insert_inheritance(&conn, child_id, "Parent", "extends").unwrap();
 
         let impls = find_implementations(&conn, "Parent", 10).unwrap();
@@ -1371,5 +2160,208 @@ mod tests {
         let conn = create_test_db();
         let count = count_refs(&conn).unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn test_py_tables_exist() {
+        let conn = create_test_db();
+        for table in &[
+            "py_endpoints",
+            "py_endpoint_handlers",
+            "py_serializer_models",
+            "py_symbol_settings",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table {} should exist", table);
+        }
+    }
+
+    #[test]
+    fn test_py_endpoints_crud() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "urls.py", 1000, 100).unwrap();
+
+        let ep_id = insert_py_endpoint(
+            &conn,
+            Some("GET"),
+            "/api/v1/users/",
+            file_id,
+            10,
+            Some("apps.users.views.UserViewSet"),
+        )
+        .unwrap();
+        assert!(ep_id > 0);
+
+        let routes = get_py_endpoints(&conn, None, 100).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].method.as_deref(), Some("GET"));
+        assert_eq!(routes[0].path_pattern, "/api/v1/users/");
+        assert_eq!(
+            routes[0].handler_qname.as_deref(),
+            Some("apps.users.views.UserViewSet")
+        );
+    }
+
+    #[test]
+    fn test_py_endpoint_handler_link() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "views.py", 1000, 100).unwrap();
+        let sym_id = insert_symbol(
+            &conn,
+            file_id,
+            "UserViewSet",
+            SymbolKind::Class,
+            5,
+            Some("class UserViewSet(ModelViewSet)"),
+        )
+        .unwrap();
+
+        let ep_id = insert_py_endpoint(
+            &conn,
+            Some("GET"),
+            "/api/v1/users/",
+            file_id,
+            10,
+            Some("UserViewSet"),
+        )
+        .unwrap();
+
+        insert_py_endpoint_handler(&conn, ep_id, sym_id, "high", Some("router.register")).unwrap();
+
+        let handler = get_py_endpoint_handler(&conn, ep_id).unwrap();
+        assert!(handler.is_some());
+        assert_eq!(handler.unwrap().name, "UserViewSet");
+    }
+
+    #[test]
+    fn test_py_serializer_model_link() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "serializers.py", 1000, 100).unwrap();
+        let ser_id = insert_symbol(
+            &conn,
+            file_id,
+            "UserSerializer",
+            SymbolKind::Class,
+            5,
+            Some("class UserSerializer(ModelSerializer)"),
+        )
+        .unwrap();
+        let model_id = insert_symbol(
+            &conn,
+            file_id,
+            "User",
+            SymbolKind::Class,
+            20,
+            Some("class User(Model)"),
+        )
+        .unwrap();
+
+        insert_py_serializer_model(&conn, ser_id, model_id, "high", Some("Meta.model = User"))
+            .unwrap();
+
+        let model = get_py_serializer_model(&conn, ser_id).unwrap();
+        assert!(model.is_some());
+        assert_eq!(model.unwrap().name, "User");
+    }
+
+    #[test]
+    fn test_py_symbol_settings_crud() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "views.py", 1000, 100).unwrap();
+        let sym_id = insert_symbol(
+            &conn,
+            file_id,
+            "get_host",
+            SymbolKind::Function,
+            5,
+            Some("def get_host()"),
+        )
+        .unwrap();
+
+        insert_py_symbol_setting(
+            &conn,
+            sym_id,
+            "CLASSIFICATION_HOST",
+            "settings",
+            "medium",
+            Some("settings.CLASSIFICATION_HOST"),
+        )
+        .unwrap();
+
+        let usages = find_py_setting_usages(&conn, "CLASSIFICATION_HOST", 100).unwrap();
+        assert_eq!(usages.len(), 1);
+        assert_eq!(usages[0].key, "CLASSIFICATION_HOST");
+        assert_eq!(usages[0].key_kind, "settings");
+        assert_eq!(usages[0].symbol_name, "get_host");
+    }
+
+    #[test]
+    fn test_find_py_endpoint_by_path() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "urls.py", 1000, 100).unwrap();
+
+        insert_py_endpoint(&conn, Some("GET"), "/api/v1/users/", file_id, 10, None).unwrap();
+        insert_py_endpoint(&conn, Some("POST"), "/api/v1/users/", file_id, 15, None).unwrap();
+        insert_py_endpoint(&conn, Some("GET"), "/api/v1/orders/", file_id, 20, None).unwrap();
+
+        // search by path pattern
+        let results = find_py_endpoint(&conn, None, "users").unwrap();
+        assert_eq!(results.len(), 2);
+
+        // search by method + path
+        let results = find_py_endpoint(&conn, Some("GET"), "users").unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].method.as_deref(), Some("GET"));
+    }
+
+    #[test]
+    fn test_clear_py_facts_for_files() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "urls.py", 1000, 100).unwrap();
+        let file_id2 = upsert_file(&conn, "views.py", 1000, 100).unwrap();
+
+        insert_py_endpoint(&conn, Some("GET"), "/api/v1/users/", file_id, 10, None).unwrap();
+        insert_py_endpoint(&conn, Some("GET"), "/api/v2/items/", file_id2, 10, None).unwrap();
+
+        let sym_id = insert_symbol(
+            &conn,
+            file_id,
+            "get_host",
+            SymbolKind::Function,
+            5,
+            Some("def get_host()"),
+        )
+        .unwrap();
+        insert_py_symbol_setting(&conn, sym_id, "HOST", "settings", "medium", None).unwrap();
+
+        // clear only for file_id
+        clear_py_facts_for_files(&conn, &[file_id]).unwrap();
+
+        // endpoints from urls.py deleted, views.py untouched
+        let routes = get_py_endpoints(&conn, None, 100).unwrap();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path_pattern, "/api/v2/items/");
+
+        // settings for symbols from urls.py deleted
+        let usages = find_py_setting_usages(&conn, "HOST", 100).unwrap();
+        assert_eq!(usages.len(), 0);
+    }
+
+    #[test]
+    fn test_clear_db_with_py_tables() {
+        let conn = create_test_db();
+        let file_id = upsert_file(&conn, "urls.py", 1000, 100).unwrap();
+        insert_py_endpoint(&conn, Some("GET"), "/api/", file_id, 1, None).unwrap();
+
+        clear_db(&conn).unwrap();
+
+        let routes = get_py_endpoints(&conn, None, 100).unwrap();
+        assert!(routes.is_empty());
     }
 }
