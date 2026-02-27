@@ -15,6 +15,28 @@ use crate::db;
 use crate::indexer;
 
 
+/// Initialize an empty index
+pub fn cmd_init(root: &Path) -> Result<()> {
+    let start = Instant::now();
+
+    if db::db_exists(root) {
+        println!(
+            "{}",
+            "Index already exists. Use 'rebuild' to reindex.".yellow()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+    db::init_db(&conn)?;
+
+    println!("{}", "Initialized empty index.".green());
+    println!("Run 'ast-index rebuild' to build the index.");
+
+    eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
 /// File count threshold for auto-switching to sub-projects mode
 const AUTO_SUB_PROJECTS_THRESHOLD: usize = 65_000;
 
@@ -84,9 +106,15 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
     if verbose { eprintln!("[verbose] deleting old DB..."); }
     let t = Instant::now();
     if let Err(e) = db::delete_db(root) {
-        eprintln!("{}", format!("Warning: could not delete old index: {}", e).yellow());
+        eprintln!(
+            "{}",
+            format!("Warning: could not delete old index: {}", e).yellow()
+        );
         if let Ok(db_path) = db::get_db_path(root) {
-            eprintln!("Cache path: {}", db_path.parent().unwrap_or(db_path.as_path()).display());
+            eprintln!(
+                "Cache path: {}",
+                db_path.parent().unwrap_or(db_path.as_path()).display()
+            );
             eprintln!("Try manually removing the cache directory and re-running rebuild.");
         }
         return Err(e);
@@ -116,12 +144,16 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
         conn.execute(
             "INSERT OR REPLACE INTO metadata (key, value) VALUES ('no_ignore', '1')",
             [],
-        ).ok();
-        println!("{}", "Including gitignored files (build/, etc.)...".yellow());
+        )
+        .ok();
+        println!(
+            "{}",
+            "Including gitignored files (build/, etc.)...".yellow()
+        );
     }
 
     // Detect project type — check actual platform markers for Mixed projects
-    let _project_type = indexer::detect_project_type(root);
+    let project_type = indexer::detect_project_type(root);
     let is_ios = indexer::has_ios_markers(root);
     let is_android = indexer::has_android_markers(root);
 
@@ -163,7 +195,10 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 let pkg_count = indexer::index_ios_package_managers(&conn, root, true)?;
                 if verbose { eprintln!("[verbose] ios_package_managers: {} in {:?}", pkg_count, t.elapsed()); }
                 if pkg_count > 0 {
-                    println!("{}", format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed());
+                    println!(
+                        "{}",
+                        format!("Indexed {} CocoaPods/Carthage deps", pkg_count).dimmed()
+                    );
                 }
             }
 
@@ -231,6 +266,20 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 if verbose { eprintln!("[verbose] ios_assets: {} defs, {} usages in {:?}", asset_count, asset_usage_count, t.elapsed()); }
             }
 
+            // Python-specific: extract Django/DRF/settings facts
+            let mut py_endpoint_count = 0;
+            let mut py_serializer_count = 0;
+            let mut py_setting_count = 0;
+            if project_type == indexer::ProjectType::Python
+                || project_type == indexer::ProjectType::Mixed
+            {
+                println!("{}", "Extracting Python framework facts...".cyan());
+                let (ep, sm, st) = indexer::extract_py_facts(&mut conn, root, true)?;
+                py_endpoint_count = ep;
+                py_serializer_count = sm;
+                py_setting_count = st;
+            }
+
             // Print summary based on project type
             if is_android && is_ios {
                 println!(
@@ -246,6 +295,15 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                     format!(
                         "Indexed {} files, {} modules, {} storyboard usages, {} assets ({} usages)",
                         file_count, module_count, sb_count, asset_count, asset_usage_count
+                    )
+                    .green()
+                );
+            } else if py_endpoint_count > 0 || py_serializer_count > 0 || py_setting_count > 0 {
+                println!(
+                    "{}",
+                    format!(
+                        "Indexed {} files, {} modules. Python: {} endpoints, {} serializer-model, {} settings",
+                        file_count, module_count, py_endpoint_count, py_serializer_count, py_setting_count
                     ).green()
                 );
             } else if dts_count > 0 {
@@ -285,7 +343,11 @@ pub fn cmd_rebuild(root: &Path, index_type: &str, index_deps: bool, no_ignore: b
                 let dep_count = indexer::index_module_dependencies(&mut conn, root, &gradle_files, true)?;
                 println!(
                     "{}",
-                    format!("Indexed {} modules, {} dependencies", module_count, dep_count).green()
+                    format!(
+                        "Indexed {} modules, {} dependencies",
+                        module_count, dep_count
+                    )
+                    .green()
                 );
             } else {
                 println!("{}", format!("Indexed {} modules", module_count).green());
@@ -427,6 +489,28 @@ pub fn cmd_update(root: &Path) -> Result<()> {
             )
             .green()
         );
+
+        // rebuild Python facts when changes detected
+        let project_type = indexer::detect_project_type(root);
+        if project_type == indexer::ProjectType::Python
+            || project_type == indexer::ProjectType::Mixed
+        {
+            // full py_* facts rebuild (faster than incremental for MVP)
+            conn.execute_batch(
+                "DELETE FROM py_symbol_settings; DELETE FROM py_serializer_models; DELETE FROM py_endpoint_handlers; DELETE FROM py_endpoints;"
+            )?;
+            let (ep, sm, st) = indexer::extract_py_facts(&mut conn, root, true)?;
+            if ep > 0 || sm > 0 || st > 0 {
+                println!(
+                    "{}",
+                    format!(
+                        "Python facts: {} endpoints, {} serializer-model, {} settings",
+                        ep, sm, st
+                    )
+                    .dimmed()
+                );
+            }
+        }
     }
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
@@ -481,7 +565,8 @@ pub fn cmd_restore(root: &Path, db_file: &str) -> Result<()> {
         format!(
             "Contains: {} files, {} symbols, {} refs",
             stats.file_count, stats.symbol_count, stats.refs_count
-        ).dimmed()
+        )
+        .dimmed()
     );
 
     Ok(())
@@ -507,9 +592,7 @@ pub fn cmd_stats(root: &Path, format: &str) -> Result<()> {
     let conn = db::open_db(root)?;
     let stats = db::get_stats(&conn)?;
     let db_path = db::get_db_path(root)?;
-    let db_size = std::fs::metadata(&db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
     if format == "json" {
         let result = serde_json::json!({

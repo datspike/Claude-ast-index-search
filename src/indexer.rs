@@ -1,11 +1,11 @@
 use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
-use std::sync::LazyLock;
 use rusqlite::Connection;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::SystemTime;
 
 use crate::parsers::{self, ParsedRef, ParsedSymbol};
@@ -32,7 +32,8 @@ impl ModuleLookup {
     }
 
     fn find(&self, file_path: &str) -> Option<i64> {
-        self.sorted.iter()
+        self.sorted
+            .iter()
             .find(|(path, _)| file_path.starts_with(path.as_str()))
             .map(|(_, id)| *id)
     }
@@ -41,15 +42,15 @@ impl ModuleLookup {
 /// Project type detected by markers
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProjectType {
-    Android,   // Kotlin/Java - build.gradle.kts, settings.gradle.kts
-    IOS,       // Swift/ObjC - Package.swift, *.xcodeproj
-    Perl,      // Perl - .pm files, Makefile.PL, Build.PL
-    Frontend,  // JS/TS - package.json
-    Python,    // Python - pyproject.toml, setup.py, setup.cfg
-    Go,        // Go - go.mod
-    Rust,      // Rust - Cargo.toml
-    Bazel,     // Bazel - BUILD, WORKSPACE
-    Mixed,     // Multiple platforms present
+    Android,  // Kotlin/Java - build.gradle.kts, settings.gradle.kts
+    IOS,      // Swift/ObjC - Package.swift, *.xcodeproj
+    Perl,     // Perl - .pm files, Makefile.PL, Build.PL
+    Frontend, // JS/TS - package.json
+    Python,   // Python - pyproject.toml, setup.py, setup.cfg
+    Go,       // Go - go.mod
+    Rust,     // Rust - Cargo.toml
+    Bazel,    // Bazel - BUILD, WORKSPACE
+    Mixed,    // Multiple platforms present
     Unknown,
 }
 
@@ -87,9 +88,12 @@ pub fn has_ios_markers(root: &Path) -> bool {
     // Check for .xcodeproj
     fs::read_dir(root)
         .map(|entries| {
-            entries
-                .filter_map(|e| e.ok())
-                .any(|e| e.path().extension().map(|ext| ext == "xcodeproj").unwrap_or(false))
+            entries.filter_map(|e| e.ok()).any(|e| {
+                e.path()
+                    .extension()
+                    .map(|ext| ext == "xcodeproj")
+                    .unwrap_or(false)
+            })
         })
         .unwrap_or(false)
 }
@@ -148,9 +152,12 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
     let has_swift = root.join("Package.swift").exists()
         || fs::read_dir(root)
             .map(|entries| {
-                entries
-                    .filter_map(|e| e.ok())
-                    .any(|e| e.path().extension().map(|ext| ext == "xcodeproj").unwrap_or(false))
+                entries.filter_map(|e| e.ok()).any(|e| {
+                    e.path()
+                        .extension()
+                        .map(|ext| ext == "xcodeproj")
+                        .unwrap_or(false)
+                })
             })
             .unwrap_or(false);
 
@@ -198,10 +205,19 @@ pub fn detect_project_type(root: &Path) -> ProjectType {
         || root.join("MODULE.bazel").exists();
 
     // Count how many platforms are detected
-    let count = [has_gradle, has_swift, has_perl, has_frontend, has_python, has_go, has_rust, has_bazel]
-        .iter()
-        .filter(|&&x| x)
-        .count();
+    let count = [
+        has_gradle,
+        has_swift,
+        has_perl,
+        has_frontend,
+        has_python,
+        has_go,
+        has_rust,
+        has_bazel,
+    ]
+    .iter()
+    .filter(|&&x| x)
+    .count();
 
     if count > 1 {
         ProjectType::Mixed
@@ -420,11 +436,11 @@ pub struct WalkResult {
     pub file_count: usize,
     pub module_files: Vec<PathBuf>,
     // iOS
-    pub storyboard_files: Vec<PathBuf>,  // .storyboard, .xib
-    pub xcassets_dirs: Vec<PathBuf>,      // .xcassets directories
+    pub storyboard_files: Vec<PathBuf>, // .storyboard, .xib
+    pub xcassets_dirs: Vec<PathBuf>,    // .xcassets directories
     // Android
-    pub xml_layout_files: Vec<PathBuf>,  // .xml in /res/(layout|menu|navigation)
-    pub res_files: Vec<PathBuf>,         // all files under /res/
+    pub xml_layout_files: Vec<PathBuf>, // .xml in /res/(layout|menu|navigation)
+    pub res_files: Vec<PathBuf>,        // all files under /res/
 }
 
 pub fn index_directory(conn: &mut Connection, root: &Path, progress: bool, no_ignore: bool) -> Result<WalkResult> {
@@ -465,9 +481,9 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
     let mut builder = WalkBuilder::new(walk_dir);
     builder
         .hidden(true)
-        .follow_links(false)     // Never follow symlinks — prevents loops in monorepos
-        .max_depth(Some(50))     // Prevent runaway traversal in deeply nested structures
-        .git_ignore(use_git)     // Respect .gitignore only if .git exists
+        .follow_links(false) // Never follow symlinks — prevents loops in monorepos
+        .max_depth(Some(50)) // Prevent runaway traversal in deeply nested structures
+        .git_ignore(use_git) // Respect .gitignore only if .git exists
         .git_exclude(use_git)
         .filter_entry(|entry| !is_excluded_dir(entry));
     // Arc repos: respect .gitignore and .arcignore without .git directory
@@ -525,7 +541,11 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
             if path_str.contains("/res/") {
                 res_files.push(path.to_path_buf());
                 // XML layout/menu/navigation files
-                if ext == "xml" && (path_str.contains("/layout") || path_str.contains("/menu") || path_str.contains("/navigation")) {
+                if ext == "xml"
+                    && (path_str.contains("/layout")
+                        || path_str.contains("/menu")
+                        || path_str.contains("/navigation"))
+                {
                     xml_layout_files.push(path.to_path_buf());
                 }
             }
@@ -614,12 +634,16 @@ pub fn index_directory_scoped(conn: &mut Connection, root: &Path, walk_dir: &Pat
 }
 
 /// Write a batch of parsed files to DB in a single transaction
-fn write_batch_to_db(conn: &mut Connection, batch: Vec<ParsedFile>, total_count: &mut usize) -> Result<()> {
+fn write_batch_to_db(
+    conn: &mut Connection,
+    batch: Vec<ParsedFile>,
+    total_count: &mut usize,
+) -> Result<()> {
     let tx = conn.transaction()?;
 
     {
         let mut file_stmt = tx.prepare_cached(
-            "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)"
+            "INSERT OR REPLACE INTO files (path, mtime, size) VALUES (?1, ?2, ?3)",
         )?;
         let mut del_sym_stmt = tx.prepare_cached("DELETE FROM symbols WHERE file_id = ?1")?;
         let mut del_ref_stmt = tx.prepare_cached("DELETE FROM refs WHERE file_id = ?1")?;
@@ -627,10 +651,10 @@ fn write_batch_to_db(conn: &mut Connection, batch: Vec<ParsedFile>, total_count:
             "INSERT INTO symbols (file_id, name, kind, line, signature) VALUES (?1, ?2, ?3, ?4, ?5)"
         )?;
         let mut inh_stmt = tx.prepare_cached(
-            "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)"
+            "INSERT INTO inheritance (child_id, parent_name, kind) VALUES (?1, ?2, ?3)",
         )?;
         let mut ref_stmt = tx.prepare_cached(
-            "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         for pf in batch {
@@ -668,7 +692,11 @@ fn write_batch_to_db(conn: &mut Connection, batch: Vec<ParsedFile>, total_count:
 }
 
 /// Incremental update: only re-index changed/new files, delete removed files
-pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress: bool) -> Result<(usize, usize, usize)> {
+pub fn update_directory_incremental(
+    conn: &mut Connection,
+    root: &Path,
+    progress: bool,
+) -> Result<(usize, usize, usize)> {
     use ignore::WalkBuilder;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -678,7 +706,11 @@ pub fn update_directory_incremental(conn: &mut Connection, root: &Path, progress
     {
         let mut stmt = conn.prepare("SELECT id, path, mtime FROM files")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
         })?;
         for row in rows {
             let (id, path, mtime) = row?;
@@ -831,7 +863,8 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
     let files: Vec<PathBuf> = walker
         .filter_map(|e| e.ok())
         .filter(|e| {
-            e.path().file_name()
+            e.path()
+                .file_name()
                 .and_then(|n| n.to_str())
                 .map(is_module_file)
                 .unwrap_or(false)
@@ -843,16 +876,22 @@ pub fn index_modules(conn: &Connection, root: &Path) -> Result<usize> {
 }
 
 /// Index modules from a pre-collected list of module files (avoids re-walking the filesystem)
-pub fn index_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf]) -> Result<usize> {
+pub fn index_modules_from_files(
+    conn: &Connection,
+    root: &Path,
+    files: &[PathBuf],
+) -> Result<usize> {
     let mut count = 0;
 
     // Regex to extract SPM targets from Package.swift
-    static SPM_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"\.(?:target|testTarget|binaryTarget)\s*\(\s*name:\s*["']([^"']+)["']"#).unwrap());
+    static SPM_TARGET_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"\.(?:target|testTarget|binaryTarget)\s*\(\s*name:\s*["']([^"']+)["']"#)
+            .unwrap()
+    });
 
     let spm_target_re = &*SPM_TARGET_RE;
 
     for path in files {
-
         if let Some(name) = path.file_name() {
             let name_str = name.to_string_lossy();
 
@@ -917,7 +956,9 @@ pub fn index_modules_from_files(conn: &Connection, root: &Path, files: &[PathBuf
             // Perl modules (.pm files with package declarations)
             if name_str.ends_with(".pm") {
                 if let Ok(content) = fs::read_to_string(path) {
-                    static PERL_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap());
+                    static PERL_PACKAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+                        Regex::new(r"^\s*package\s+([A-Za-z_][A-Za-z0-9_:]*)\s*;").unwrap()
+                    });
                     let re = &*PERL_PACKAGE_RE;
                     {
                         for caps in re.captures_iter(&content) {
@@ -998,16 +1039,24 @@ pub fn collect_build_files_from_db(conn: &Connection, root: &Path) -> Result<Vec
 }
 
 /// Parse module dependencies from build.gradle files
-pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_files: &[PathBuf], progress: bool) -> Result<usize> {
-
+pub fn index_module_dependencies(
+    conn: &mut Connection,
+    root: &Path,
+    gradle_files: &[PathBuf],
+    progress: bool,
+) -> Result<usize> {
     // Regex patterns for dependency declarations
     // Gradle projects DSL style: modules { api(projects.features.payments.api) }
-    static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*(api|implementation|compileOnly|testImplementation)\s*\(\s*projects\.([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)").unwrap());
+    static PROJECTS_DEP_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?m)^\s*(api|implementation|compileOnly|testImplementation)\s*\(\s*projects\.([a-zA-Z_][a-zA-Z0-9_.]*)\s*\)").unwrap()
+    });
 
     let projects_dep_re = &*PROJECTS_DEP_RE;
 
     // Standard Gradle style: implementation(project(":features:payments:api"))
-    static GRADLE_PROJECT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?m)(api|implementation|compileOnly|testImplementation)\s*\(\s*project\s*\(\s*["']:([^"']+)["']\s*\)"#).unwrap());
+    static GRADLE_PROJECT_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?m)(api|implementation|compileOnly|testImplementation)\s*\(\s*project\s*\(\s*["']:([^"']+)["']\s*\)"#).unwrap()
+    });
 
     let gradle_project_re = &*GRADLE_PROJECT_RE;
 
@@ -1113,7 +1162,10 @@ pub fn index_module_dependencies(conn: &mut Connection, root: &Path, gradle_file
 }
 
 /// Get dependencies of a module
-pub fn get_module_deps(conn: &Connection, module_name: &str) -> Result<Vec<(String, String, String)>> {
+pub fn get_module_deps(
+    conn: &Connection,
+    module_name: &str,
+) -> Result<Vec<(String, String, String)>> {
     // Returns (dep_module_name, dep_module_path, dep_kind)
     let mut stmt = conn.prepare(
         r#"
@@ -1123,7 +1175,7 @@ pub fn get_module_deps(conn: &Connection, module_name: &str) -> Result<Vec<(Stri
         JOIN modules m2 ON md.dep_module_id = m2.id
         WHERE m1.name = ?1 OR m1.path = ?1
         ORDER BY md.dep_kind, m2.name
-        "#
+        "#,
     )?;
 
     let results = stmt
@@ -1136,7 +1188,10 @@ pub fn get_module_deps(conn: &Connection, module_name: &str) -> Result<Vec<(Stri
 }
 
 /// Get modules that depend on this module
-pub fn get_module_dependents(conn: &Connection, module_name: &str) -> Result<Vec<(String, String, String)>> {
+pub fn get_module_dependents(
+    conn: &Connection,
+    module_name: &str,
+) -> Result<Vec<(String, String, String)>> {
     // Returns (dependent_module_name, dependent_module_path, dep_kind)
     let mut stmt = conn.prepare(
         r#"
@@ -1146,7 +1201,7 @@ pub fn get_module_dependents(conn: &Connection, module_name: &str) -> Result<Vec
         JOIN modules m2 ON md.dep_module_id = m2.id
         WHERE m2.name = ?1 OR m2.path = ?1
         ORDER BY md.dep_kind, m1.name
-        "#
+        "#,
     )?;
 
     let results = stmt
@@ -1169,25 +1224,38 @@ pub struct XmlUsage {
 }
 
 /// Index XML layouts for class usages
-pub fn index_xml_usages(conn: &mut Connection, root: &Path, xml_layout_files: &[PathBuf], progress: bool) -> Result<usize> {
+pub fn index_xml_usages(
+    conn: &mut Connection,
+    root: &Path,
+    xml_layout_files: &[PathBuf],
+    progress: bool,
+) -> Result<usize> {
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for class names in XML
     // Full class name: <com.example.MyView ...>
-    static FULL_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"<([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)").unwrap());
+    static FULL_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"<([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)").unwrap()
+    });
 
     let full_class_re = &*FULL_CLASS_RE;
     // view class="..." or fragment android:name="..."
-    static CLASS_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:class|android:name)\s*=\s*["']([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)["']"#).unwrap());
+    static CLASS_ATTR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?:class|android:name)\s*=\s*["']([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*\.[A-Z][a-zA-Z0-9_]*)["']"#).unwrap()
+    });
 
     let class_attr_re = &*CLASS_ATTR_RE;
     // android:id="@+id/xxx"
-    static ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"android:id\s*=\s*["']@\+?id/([^"']+)["']"#).unwrap());
+    static ID_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"android:id\s*=\s*["']@\+?id/([^"']+)["']"#).unwrap());
 
     let id_re = &*ID_RE;
 
     if progress {
-        eprintln!("Found {} XML layout files to index...", xml_layout_files.len());
+        eprintln!(
+            "Found {} XML layout files to index...",
+            xml_layout_files.len()
+        );
     }
 
     let tx = conn.transaction()?;
@@ -1216,7 +1284,9 @@ pub fn index_xml_usages(conn: &mut Connection, root: &Path, xml_layout_files: &[
                     let line_num = line_num + 1;
 
                     // Extract element_id if present on this line
-                    let element_id = id_re.captures(line).map(|c| c.get(1).unwrap().as_str().to_string());
+                    let element_id = id_re
+                        .captures(line)
+                        .map(|c| c.get(1).unwrap().as_str().to_string());
 
                     // Full class name tags
                     for caps in full_class_re.captures_iter(line) {
@@ -1235,11 +1305,12 @@ pub fn index_xml_usages(conn: &mut Connection, root: &Path, xml_layout_files: &[
                     // class="..." or android:name="..." attributes
                     for caps in class_attr_re.captures_iter(line) {
                         let class_name = caps.get(1).unwrap().as_str();
-                        let usage_type = if line.contains("<fragment") || line.contains("android:name") {
-                            "fragment"
-                        } else {
-                            "view_class_attr"
-                        };
+                        let usage_type =
+                            if line.contains("<fragment") || line.contains("android:name") {
+                                "fragment"
+                            } else {
+                                "view_class_attr"
+                            };
                         stmt.execute(rusqlite::params![
                             module_id,
                             rel_path,
@@ -1305,7 +1376,12 @@ impl ResourceType {
 }
 
 /// Index Android resources (drawable, string, color, etc.)
-pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf], progress: bool) -> Result<(usize, usize)> {
+pub fn index_resources(
+    conn: &mut Connection,
+    root: &Path,
+    res_files: &[PathBuf],
+    progress: bool,
+) -> Result<(usize, usize)> {
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     if progress {
@@ -1322,24 +1398,38 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
     let mut usage_count = 0;
 
     // Regex for resource references
-    static R_REF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"R\.(drawable|string|color|dimen|style|layout|id|mipmap)\.([a-zA-Z_][a-zA-Z0-9_]*)").unwrap());
+    static R_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r"R\.(drawable|string|color|dimen|style|layout|id|mipmap)\.([a-zA-Z_][a-zA-Z0-9_]*)",
+        )
+        .unwrap()
+    });
 
     let r_ref_re = &*R_REF_RE;
-    static XML_REF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"@(drawable|string|color|dimen|style|layout|id|mipmap)/([a-zA-Z_][a-zA-Z0-9_]*)"#).unwrap());
+    static XML_REF_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(
+            r#"@(drawable|string|color|dimen|style|layout|id|mipmap)/([a-zA-Z_][a-zA-Z0-9_]*)"#,
+        )
+        .unwrap()
+    });
 
     let xml_ref_re = &*XML_REF_RE;
 
     // Resource definitions regex for values/*.xml
-    static STRING_DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<string\s+name="([^"]+)""#).unwrap());
+    static STRING_DEF_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"<string\s+name="([^"]+)""#).unwrap());
 
     let string_def_re = &*STRING_DEF_RE;
-    static COLOR_DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<color\s+name="([^"]+)""#).unwrap());
+    static COLOR_DEF_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"<color\s+name="([^"]+)""#).unwrap());
 
     let color_def_re = &*COLOR_DEF_RE;
-    static DIMEN_DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<dimen\s+name="([^"]+)""#).unwrap());
+    static DIMEN_DEF_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"<dimen\s+name="([^"]+)""#).unwrap());
 
     let dimen_def_re = &*DIMEN_DEF_RE;
-    static STYLE_DEF_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"<style\s+name="([^"]+)""#).unwrap());
+    static STYLE_DEF_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"<style\s+name="([^"]+)""#).unwrap());
 
     let style_def_re = &*STYLE_DEF_RE;
 
@@ -1361,7 +1451,11 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
             // Drawable files
             if rel_path.contains("/drawable") || rel_path.contains("/mipmap") {
                 if let Some(name) = res_path.file_stem().and_then(|n| n.to_str()) {
-                    let res_type = if rel_path.contains("/mipmap") { "mipmap" } else { "drawable" };
+                    let res_type = if rel_path.contains("/mipmap") {
+                        "mipmap"
+                    } else {
+                        "drawable"
+                    };
                     res_stmt.execute(rusqlite::params![module_id, res_type, name, rel_path, 1])?;
                     resource_count += 1;
                 }
@@ -1383,22 +1477,46 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
 
                         if let Some(caps) = string_def_re.captures(line) {
                             let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![module_id, "string", name, rel_path, line_num as i64])?;
+                            res_stmt.execute(rusqlite::params![
+                                module_id,
+                                "string",
+                                name,
+                                rel_path,
+                                line_num as i64
+                            ])?;
                             resource_count += 1;
                         }
                         if let Some(caps) = color_def_re.captures(line) {
                             let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![module_id, "color", name, rel_path, line_num as i64])?;
+                            res_stmt.execute(rusqlite::params![
+                                module_id,
+                                "color",
+                                name,
+                                rel_path,
+                                line_num as i64
+                            ])?;
                             resource_count += 1;
                         }
                         if let Some(caps) = dimen_def_re.captures(line) {
                             let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![module_id, "dimen", name, rel_path, line_num as i64])?;
+                            res_stmt.execute(rusqlite::params![
+                                module_id,
+                                "dimen",
+                                name,
+                                rel_path,
+                                line_num as i64
+                            ])?;
                             resource_count += 1;
                         }
                         if let Some(caps) = style_def_re.captures(line) {
                             let name = caps.get(1).unwrap().as_str();
-                            res_stmt.execute(rusqlite::params![module_id, "style", name, rel_path, line_num as i64])?;
+                            res_stmt.execute(rusqlite::params![
+                                module_id,
+                                "style",
+                                name,
+                                rel_path,
+                                line_num as i64
+                            ])?;
                             resource_count += 1;
                         }
                     }
@@ -1411,9 +1529,14 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
     let resource_ids: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = {
         let mut stmt = tx.prepare("SELECT id, type, name FROM resources")?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?;
-        let mut map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> = std::collections::HashMap::new();
+        let mut map: std::collections::HashMap<String, std::collections::HashMap<String, i64>> =
+            std::collections::HashMap::new();
         for row in rows {
             let (id, res_type, name) = row?;
             map.entry(res_type).or_default().insert(name, id);
@@ -1449,8 +1572,15 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
                             let res_type = caps.get(1).unwrap().as_str();
                             let res_name = caps.get(2).unwrap().as_str();
 
-                            if let Some(&resource_id) = resource_ids.get(res_type).and_then(|m| m.get(res_name)) {
-                                usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "code"])?;
+                            if let Some(&resource_id) =
+                                resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                            {
+                                usage_stmt.execute(rusqlite::params![
+                                    resource_id,
+                                    rel_path,
+                                    line_num as i64,
+                                    "code"
+                                ])?;
                                 usage_count += 1;
                             }
                         }
@@ -1461,8 +1591,15 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
                         let res_type = caps.get(1).unwrap().as_str();
                         let res_name = caps.get(2).unwrap().as_str();
 
-                        if let Some(&resource_id) = resource_ids.get(res_type).and_then(|m| m.get(res_name)) {
-                            usage_stmt.execute(rusqlite::params![resource_id, rel_path, line_num as i64, "xml"])?;
+                        if let Some(&resource_id) =
+                            resource_ids.get(res_type).and_then(|m| m.get(res_name))
+                        {
+                            usage_stmt.execute(rusqlite::params![
+                                resource_id,
+                                rel_path,
+                                line_num as i64,
+                                "xml"
+                            ])?;
                             usage_count += 1;
                         }
                     }
@@ -1480,10 +1617,9 @@ pub fn index_resources(conn: &mut Connection, root: &Path, res_files: &[PathBuf]
 pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<usize> {
     // Get all direct dependencies
     let direct_deps: Vec<(i64, i64, String)> = {
-        let mut stmt = conn.prepare("SELECT module_id, dep_module_id, dep_kind FROM module_deps")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
+        let mut stmt =
+            conn.prepare("SELECT module_id, dep_module_id, dep_kind FROM module_deps")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
 
@@ -1524,8 +1660,14 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
 
         // For each module, BFS to find all transitive dependencies
         for (module_id, dep_id, _) in &direct_deps {
-            let mod_name = module_names.get(module_id).map(|s| s.as_str()).unwrap_or(unknown);
-            let dep_name = module_names.get(dep_id).map(|s| s.as_str()).unwrap_or(unknown);
+            let mod_name = module_names
+                .get(module_id)
+                .map(|s| s.as_str())
+                .unwrap_or(unknown);
+            let dep_name = module_names
+                .get(dep_id)
+                .map(|s| s.as_str())
+                .unwrap_or(unknown);
 
             // Direct dependency
             let path = format!("{} -> {}", mod_name, dep_name);
@@ -1535,12 +1677,16 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
             // BFS for transitive (only through api deps)
             let mut visited: std::collections::HashSet<i64> = std::collections::HashSet::new();
             visited.insert(*dep_id);
-            let mut queue: std::collections::VecDeque<(i64, usize, String)> = std::collections::VecDeque::new();
+            let mut queue: std::collections::VecDeque<(i64, usize, String)> =
+                std::collections::VecDeque::new();
 
             // Add api dependencies of dep_id
             if let Some(next_deps) = api_deps.get(dep_id) {
                 for &next_dep in next_deps {
-                    let next_name = module_names.get(&next_dep).map(|s| s.as_str()).unwrap_or(unknown);
+                    let next_name = module_names
+                        .get(&next_dep)
+                        .map(|s| s.as_str())
+                        .unwrap_or(unknown);
                     let next_path = format!("{} -> {} -> {}", mod_name, dep_name, next_name);
                     queue.push_back((next_dep, 2, next_path));
                 }
@@ -1559,7 +1705,10 @@ pub fn build_transitive_deps(conn: &mut Connection, progress: bool) -> Result<us
                 if let Some(next_deps) = api_deps.get(&trans_dep) {
                     for &next_dep in next_deps {
                         if !visited.contains(&next_dep) {
-                            let next_name = module_names.get(&next_dep).map(|s| s.as_str()).unwrap_or(unknown);
+                            let next_name = module_names
+                                .get(&next_dep)
+                                .map(|s| s.as_str())
+                                .unwrap_or(unknown);
                             let next_path = format!("{} -> {}", path, next_name);
                             queue.push_back((next_dep, depth + 1, next_path));
                         }
@@ -1589,21 +1738,32 @@ pub struct StoryboardUsage {
 }
 
 /// Index iOS storyboard and XIB files for class usages
-pub fn index_storyboard_usages(conn: &mut Connection, root: &Path, storyboard_files: &[PathBuf], progress: bool) -> Result<usize> {
+pub fn index_storyboard_usages(
+    conn: &mut Connection,
+    root: &Path,
+    storyboard_files: &[PathBuf],
+    progress: bool,
+) -> Result<usize> {
     let module_lookup = ModuleLookup::from_db(conn)?;
 
     // Regex for customClass in storyboards/xibs
     // <viewController customClass="MyViewController" ...>
-    static CUSTOM_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"customClass\s*=\s*["']([A-Z][a-zA-Z0-9_]+)["']"#).unwrap());
+    static CUSTOM_CLASS_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r#"customClass\s*=\s*["']([A-Z][a-zA-Z0-9_]+)["']"#).unwrap());
 
     let custom_class_re = &*CUSTOM_CLASS_RE;
     // storyboardIdentifier="..."
-    static STORYBOARD_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:storyboardIdentifier|identifier)\s*=\s*["']([^"']+)["']"#).unwrap());
+    static STORYBOARD_ID_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?:storyboardIdentifier|identifier)\s*=\s*["']([^"']+)["']"#).unwrap()
+    });
 
     let storyboard_id_re = &*STORYBOARD_ID_RE;
 
     if progress {
-        eprintln!("Found {} storyboard/xib files to index...", storyboard_files.len());
+        eprintln!(
+            "Found {} storyboard/xib files to index...",
+            storyboard_files.len()
+        );
     }
 
     let tx = conn.transaction()?;
@@ -1632,16 +1792,25 @@ pub fn index_storyboard_usages(conn: &mut Connection, root: &Path, storyboard_fi
                     let line_num = line_num + 1;
 
                     // Extract storyboard identifier if present
-                    let sb_id = storyboard_id_re.captures(line).map(|c| c.get(1).unwrap().as_str().to_string());
+                    let sb_id = storyboard_id_re
+                        .captures(line)
+                        .map(|c| c.get(1).unwrap().as_str().to_string());
 
                     // Extract custom classes
                     if let Some(caps) = custom_class_re.captures(line) {
                         let class_name = caps.get(1).unwrap().as_str();
 
                         // Determine usage type based on element
-                        let usage_type = if line.contains("<viewController") || line.contains("<tableViewController") || line.contains("<collectionViewController") || line.contains("<navigationController") || line.contains("<tabBarController") {
+                        let usage_type = if line.contains("<viewController")
+                            || line.contains("<tableViewController")
+                            || line.contains("<collectionViewController")
+                            || line.contains("<navigationController")
+                            || line.contains("<tabBarController")
+                        {
                             "viewController"
-                        } else if line.contains("<tableViewCell") || line.contains("<collectionViewCell") {
+                        } else if line.contains("<tableViewCell")
+                            || line.contains("<collectionViewCell")
+                        {
                             "cell"
                         } else if line.contains("<view") || line.contains("<View") {
                             "view"
@@ -1709,7 +1878,12 @@ impl IosAssetType {
 }
 
 /// Index iOS Assets.xcassets
-pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[PathBuf], progress: bool) -> Result<(usize, usize)> {
+pub fn index_ios_assets(
+    conn: &mut Connection,
+    root: &Path,
+    xcassets_dirs: &[PathBuf],
+    progress: bool,
+) -> Result<(usize, usize)> {
     use ignore::WalkBuilder;
 
     let module_lookup = ModuleLookup::from_db(conn)?;
@@ -1729,7 +1903,7 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[Pat
 
     {
         let mut asset_stmt = tx.prepare_cached(
-            "INSERT INTO ios_assets (module_id, type, name, file_path) VALUES (?1, ?2, ?3, ?4)"
+            "INSERT INTO ios_assets (module_id, type, name, file_path) VALUES (?1, ?2, ?3, ?4)",
         )?;
 
         // Index assets from .xcassets directories
@@ -1743,16 +1917,17 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[Pat
             let module_id = module_lookup.find(&rel_xcassets);
 
             // Walk inside xcassets to find imagesets, colorsets, etc.
-            let inner_walker = WalkBuilder::new(xcassets_dir)
-                .hidden(false)
-                .build();
+            let inner_walker = WalkBuilder::new(xcassets_dir).hidden(false).build();
 
             for entry in inner_walker {
                 if let Ok(entry) = entry {
                     let path = entry.path();
                     if path.is_dir() {
                         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                            if matches!(ext, "imageset" | "colorset" | "appiconset" | "launchimage" | "dataset") {
+                            if matches!(
+                                ext,
+                                "imageset" | "colorset" | "appiconset" | "launchimage" | "dataset"
+                            ) {
                                 if let Some(name) = path.file_stem().and_then(|n| n.to_str()) {
                                     let rel_path = path
                                         .strip_prefix(root)
@@ -1793,10 +1968,14 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[Pat
 
     // Index asset usages in Swift code
     // UIImage(named: "assetName") or Image("assetName") or Color("colorName")
-    static SWIFT_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:UIImage\s*\(\s*named:\s*["']|Image\s*\(\s*["']|\.image\s*\(\s*named:\s*["'])([^"']+)["']"#).unwrap());
+    static SWIFT_IMAGE_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?:UIImage\s*\(\s*named:\s*["']|Image\s*\(\s*["']|\.image\s*\(\s*named:\s*["'])([^"']+)["']"#).unwrap()
+    });
 
     let swift_image_re = &*SWIFT_IMAGE_RE;
-    static SWIFT_COLOR_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?:UIColor\s*\(\s*named:\s*["']|Color\s*\(\s*["'])([^"']+)["']"#).unwrap());
+    static SWIFT_COLOR_RE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r#"(?:UIColor\s*\(\s*named:\s*["']|Color\s*\(\s*["'])([^"']+)["']"#).unwrap()
+    });
 
     let swift_color_re = &*SWIFT_COLOR_RE;
 
@@ -1823,7 +2002,12 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[Pat
                     for caps in swift_image_re.captures_iter(line) {
                         let asset_name = caps.get(1).unwrap().as_str();
                         if let Some(&asset_id) = asset_ids.get(asset_name) {
-                            usage_stmt.execute(rusqlite::params![asset_id, rel_path, line_num as i64, "code"])?;
+                            usage_stmt.execute(rusqlite::params![
+                                asset_id,
+                                rel_path,
+                                line_num as i64,
+                                "code"
+                            ])?;
                             usage_count += 1;
                         }
                     }
@@ -1832,7 +2016,12 @@ pub fn index_ios_assets(conn: &mut Connection, root: &Path, xcassets_dirs: &[Pat
                     for caps in swift_color_re.captures_iter(line) {
                         let asset_name = caps.get(1).unwrap().as_str();
                         if let Some(&asset_id) = asset_ids.get(asset_name) {
-                            usage_stmt.execute(rusqlite::params![asset_id, rel_path, line_num as i64, "code"])?;
+                            usage_stmt.execute(rusqlite::params![
+                                asset_id,
+                                rel_path,
+                                line_num as i64,
+                                "code"
+                            ])?;
                             usage_count += 1;
                         }
                     }
@@ -1859,7 +2048,8 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     if podfile.exists() {
         if let Ok(content) = fs::read_to_string(&podfile) {
             // pod 'PodName', '~> 1.0'
-            static POD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"pod\s+['"]([^'"]+)['"]"#).unwrap());
+            static POD_RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r#"pod\s+['"]([^'"]+)['"]"#).unwrap());
 
             let pod_re = &*POD_RE;
 
@@ -1880,7 +2070,8 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
         if let Ok(content) = fs::read_to_string(&podfile_lock) {
             // PODS:
             //   - PodName (1.0.0)
-            static POD_LOCK_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"^\s+-\s+([A-Za-z0-9_-]+)\s+\("#).unwrap());
+            static POD_LOCK_RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r#"^\s+-\s+([A-Za-z0-9_-]+)\s+\("#).unwrap());
 
             let pod_lock_re = &*POD_LOCK_RE;
 
@@ -1902,7 +2093,8 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     if cartfile.exists() {
         if let Ok(content) = fs::read_to_string(&cartfile) {
             // github "owner/repo" ~> 1.0
-            static CARTHAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
+            static CARTHAGE_RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
 
             let carthage_re = &*CARTHAGE_RE;
 
@@ -1922,7 +2114,8 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     let cartfile_resolved = root.join("Cartfile.resolved");
     if cartfile_resolved.exists() {
         if let Ok(content) = fs::read_to_string(&cartfile_resolved) {
-            static CARTHAGE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
+            static CARTHAGE_RE: LazyLock<Regex> =
+                LazyLock::new(|| Regex::new(r#"github\s+["']([^"']+)["']"#).unwrap());
 
             let carthage_re = &*CARTHAGE_RE;
 
@@ -1945,13 +2138,6 @@ pub fn index_ios_package_managers(conn: &Connection, root: &Path, progress: bool
     Ok(count)
 }
 
-/// Index .d.ts files from node_modules (type declarations for external libraries).
-/// These provide symbol definitions for imported libraries (e.g., React, lodash).
-/// Only .d.ts files are indexed — not full JS/TS source from node_modules.
-///
-/// Handles pnpm (symlinks to store) by resolving top-level package symlinks
-/// and mapping paths back to node_modules/... for storage.
-/// Does NOT use follow_links to avoid loops on FUSE mounts (Arcadia).
 pub fn index_node_modules_dts(conn: &mut Connection, root: &Path, progress: bool) -> Result<usize> {
     use ignore::WalkBuilder;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2153,6 +2339,1103 @@ fn parse_dts_file(file_path: &Path, rel_path: &str) -> Result<ParsedFile> {
     })
 }
 
+
+// === Python Django/DRF/settings extraction pipeline ===
+
+/// Extracted Django/DRF endpoint
+#[derive(Debug)]
+pub struct ExtractedEndpoint {
+    pub method: Option<String>,
+    pub path_pattern: String,
+    pub line: usize,
+    pub handler_qname: Option<String>,
+}
+
+/// Extracted serializer -> model relationship
+#[derive(Debug)]
+#[allow(dead_code)] // `line` field reserved for future diagnostics output
+pub struct ExtractedSerializerModel {
+    pub serializer_name: String,
+    pub model_name: String,
+    pub line: usize,
+}
+
+/// Extracted settings/env usage
+#[derive(Debug)]
+pub struct ExtractedSettingUsage {
+    pub key: String,
+    pub key_kind: String, // "settings", "env", "env_default"
+    pub line: usize,
+    pub context_symbol: Option<String>, // nearest function/class name
+}
+
+/// Regex patterns for extraction
+static PY_URL_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // path("route/", view, name="..."), re_path(r"^route/$", view)
+    // group 2: capture handler up to comma/closing paren
+    Regex::new(r#"(?:re_)?path\s*\(\s*(?:r)?["']([^"']+)["']\s*,\s*([^,)]+)"#).unwrap()
+});
+
+static PY_ROUTER_REGISTER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // router.register(r"users", UserViewSet, basename="user")
+    Regex::new(r#"\.register\s*\(\s*(?:r)?["']([^"']+)["']\s*,\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#)
+        .unwrap()
+});
+
+static PY_TUPLE_ENDPOINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // ("prefix", SomeViewSet) or ("prefix", SomeView) — tuple lists of endpoints
+    Regex::new(r#"\(\s*["']([^"']+)["']\s*,\s*([A-Z][a-zA-Z0-9_]*(?:ViewSet|View))\b"#).unwrap()
+});
+
+static PY_ACTION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // @action(detail=True, methods=["post", "get"], url_path="activate")
+    Regex::new(r#"@action\s*\(([^)]*)\)"#).unwrap()
+});
+
+static PY_ACTION_METHODS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"methods\s*=\s*\[([^\]]*)\]"#).unwrap());
+
+static PY_ACTION_URL_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"url_path\s*=\s*["']([^"']+)["']"#).unwrap());
+
+static PY_ACTION_DETAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"detail\s*=\s*(True|False)"#).unwrap());
+
+static PY_META_MODEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // model = User / model = models.User
+    Regex::new(r#"^\s*model\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#).unwrap()
+});
+
+static PY_SETTINGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // settings.SOME_KEY, django.conf.settings.KEY
+    Regex::new(r#"settings\.([A-Z][A-Z0-9_]+)"#).unwrap()
+});
+
+static PY_GETENV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // os.getenv("KEY"), os.environ.get("KEY"), os.environ["KEY"]
+    Regex::new(r#"os\.(?:getenv|environ\.get|environ\[)\s*\(?\s*["']([^"']+)["']"#).unwrap()
+});
+
+static PY_ENV_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // env("KEY"), env.str("KEY"), env.bool("KEY"), config("KEY")
+    Regex::new(r#"(?:env|config)\s*(?:\.\w+)?\s*\(\s*["']([^"']+)["']"#).unwrap()
+});
+
+static PY_FROM_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // from X.Y.Z import A, B, C as D
+    // also handles: from .foo import Bar
+    Regex::new(r#"^from\s+(\.{0,3}[a-zA-Z_][a-zA-Z0-9_.]*)\s+import\s+(.+)"#).unwrap()
+});
+
+static PY_PLAIN_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // import X.Y.Z [as W]
+    Regex::new(r#"^import\s+([a-zA-Z_][a-zA-Z0-9_.]+)(\s+as\s+([a-zA-Z_]\w*))?"#).unwrap()
+});
+
+static PY_IMPORT_AS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // A as B (within import list)
+    Regex::new(r#"^\s*([a-zA-Z_]\w*)\s+as\s+([a-zA-Z_]\w*)\s*$"#).unwrap()
+});
+
+static PY_SERIALIZER_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // serializer_class = UserSerializer
+    Regex::new(r#"serializer_class\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#).unwrap()
+});
+
+static PY_GET_SERIALIZER_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // def get_serializer_class(...): ... return UserSerializer
+    Regex::new(r#"return\s+([A-Z][a-zA-Z0-9_]*Serializer)\b"#).unwrap()
+});
+
+/// Resolved Python import: local_name -> (module_path, original_name)
+#[derive(Debug, Clone)]
+pub struct PyImport {
+    pub local_name: String,    // name used in this file
+    pub module_path: String,   // dotted module path
+    pub original_name: String, // original name (before `as`)
+}
+
+/// Build import map for a Python file from its content.
+///
+/// Parses `import X`, `import X as Y`, `from A.B import C`, `from A.B import C as D`.
+/// Returns list of PyImport entries mapping local names to their source modules.
+pub fn build_py_import_map(content: &str) -> Vec<PyImport> {
+    let mut imports = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // skip comments and empty lines
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // from X.Y import A, B as C
+        if let Some(caps) = PY_FROM_IMPORT_RE.captures(trimmed) {
+            let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let names_str = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+            for name_part in names_str.split(',') {
+                let name_part = name_part.trim();
+                if name_part.is_empty() || name_part == "(" || name_part == ")" {
+                    continue;
+                }
+
+                if let Some(as_caps) = PY_IMPORT_AS_RE.captures(name_part) {
+                    let original = as_caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                    let alias = as_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                    if !original.is_empty() && !alias.is_empty() {
+                        imports.push(PyImport {
+                            local_name: alias.to_string(),
+                            module_path: module_path.to_string(),
+                            original_name: original.to_string(),
+                        });
+                    }
+                } else {
+                    let name = name_part
+                        .trim()
+                        .trim_end_matches(')')
+                        .trim_start_matches('(')
+                        .trim();
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_alphabetic() || c == '_')
+                            .unwrap_or(false)
+                    {
+                        imports.push(PyImport {
+                            local_name: name.to_string(),
+                            module_path: module_path.to_string(),
+                            original_name: name.to_string(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // import X.Y.Z as W / import X.Y.Z
+        if let Some(caps) = PY_PLAIN_IMPORT_RE.captures(trimmed) {
+            let full_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let alias = caps.get(3).map(|m| m.as_str());
+
+            if let Some(a) = alias {
+                imports.push(PyImport {
+                    local_name: a.trim().to_string(),
+                    module_path: full_path.to_string(),
+                    original_name: full_path.to_string(),
+                });
+            } else {
+                // import a.b.c -> local name is "a"
+                let local = full_path.split('.').next().unwrap_or(full_path);
+                imports.push(PyImport {
+                    local_name: local.to_string(),
+                    module_path: full_path.to_string(),
+                    original_name: full_path.to_string(),
+                });
+            }
+        }
+    }
+
+    imports
+}
+
+/// Resolve a name used in Python code to its symbol_id via import map and DB.
+///
+/// Given name "UserSerializer" used in a file, look up:
+/// 1. Is it directly imported? (from X import UserSerializer)
+/// 2. If imported, find the source module and symbol
+/// 3. If not imported, fallback to global name match
+pub fn resolve_py_name_to_symbol(
+    conn: &rusqlite::Connection,
+    name: &str,
+    import_map: &[PyImport],
+) -> Option<(i64, String)> {
+    // Step 1: check if name is in import map
+    for imp in import_map {
+        if imp.local_name == name {
+            // Try to find symbol by original_name in files matching module_path
+            let file_pattern = module_path_to_file_pattern(&imp.module_path);
+
+            let result: Option<(i64, String)> = conn
+                .query_row(
+                    r#"
+                    SELECT s.id, f.path
+                    FROM symbols s
+                    JOIN files f ON s.file_id = f.id
+                    WHERE s.name = ?1 AND f.path LIKE ?2
+                    LIMIT 1
+                    "#,
+                    rusqlite::params![imp.original_name, file_pattern],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+
+            if result.is_some() {
+                return result;
+            }
+
+            // Fallback: just match by original name
+            let result: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT s.id, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1 AND s.kind = 'class' LIMIT 1",
+                    rusqlite::params![imp.original_name],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .ok();
+
+            if result.is_some() {
+                return result;
+            }
+        }
+    }
+
+    // Step 2: not in imports -- global search by name (low confidence)
+    conn.query_row(
+        "SELECT s.id, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1 AND s.kind = 'class' LIMIT 1",
+        rusqlite::params![name],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Convert Python module path to SQL LIKE pattern for file path matching
+fn module_path_to_file_pattern(module_path: &str) -> String {
+    // Handle relative imports
+    let clean = module_path.trim_start_matches('.');
+    if clean.is_empty() {
+        return "%".to_string();
+    }
+    // a.b.c -> %a/b/c% (matches a/b/c.py and a/b/c/__init__.py)
+    let path_part = clean.replace('.', "/");
+    format!("%{}%", path_part)
+}
+
+/// Extract serializer_class = X from handler file content.
+///
+/// Returns: Vec of (class_name, serializer_name, line_number).
+pub fn extract_py_handler_serializers(content: &str) -> Vec<(String, String, usize)> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut current_class: Option<String> = None;
+    let mut class_indent = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+
+        // Track class scope
+        if stripped.starts_with("class ") {
+            if let Some(end) = stripped.find(['(', ':']) {
+                let name = stripped["class ".len()..end].trim();
+                current_class = Some(name.to_string());
+                class_indent = indent;
+            }
+            continue;
+        }
+
+        // Exit class scope
+        if current_class.is_some()
+            && indent <= class_indent
+            && !stripped.is_empty()
+            && indent < class_indent
+        {
+            current_class = None;
+        }
+
+        if let Some(ref cls_name) = current_class {
+            // serializer_class = SomeSerializer
+            if let Some(caps) = PY_SERIALIZER_CLASS_RE.captures(stripped) {
+                let ser_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !ser_name.is_empty() {
+                    results.push((cls_name.clone(), ser_name.to_string(), i + 1));
+                }
+            }
+
+            // def get_serializer_class(...): ... return XSerializer
+            if let Some(caps) = PY_GET_SERIALIZER_CLASS_RE.captures(stripped) {
+                let ser_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !ser_name.is_empty() {
+                    results.push((cls_name.clone(), ser_name.to_string(), i + 1));
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract Django urlpatterns and DRF router.register from file content
+pub fn extract_py_endpoints(content: &str) -> Vec<ExtractedEndpoint> {
+    let mut endpoints = Vec::new();
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num + 1;
+        let trimmed = line.trim();
+
+        // skip comments
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        // Django path()/re_path()
+        for caps in PY_URL_PATH_RE.captures_iter(line) {
+            let path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let raw_handler = caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+            if !path.is_empty() {
+                // strip .as_view(), whitespace, parens from handler
+                let handler = raw_handler
+                    .trim_end_matches(')')
+                    .trim_end_matches('(')
+                    .trim_end_matches(".as_view")
+                    .trim();
+                endpoints.push(ExtractedEndpoint {
+                    method: None, // Django path() doesn't specify HTTP method
+                    path_pattern: path.to_string(),
+                    line: line_num,
+                    handler_qname: if handler.is_empty() {
+                        None
+                    } else {
+                        Some(handler.to_string())
+                    },
+                });
+            }
+        }
+
+        // DRF router.register()
+        for caps in PY_ROUTER_REGISTER_RE.captures_iter(line) {
+            let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let viewset = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if !prefix.is_empty() {
+                endpoints.push(ExtractedEndpoint {
+                    method: None,
+                    path_pattern: prefix.to_string(),
+                    line: line_num,
+                    handler_qname: if viewset.is_empty() {
+                        None
+                    } else {
+                        Some(viewset.to_string())
+                    },
+                });
+            }
+        }
+
+        // DRF tuple endpoints: ("prefix", SomeViewSet)
+        for caps in PY_TUPLE_ENDPOINT_RE.captures_iter(line) {
+            let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let viewset = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+            if !prefix.is_empty() {
+                endpoints.push(ExtractedEndpoint {
+                    method: None,
+                    path_pattern: prefix.to_string(),
+                    line: line_num,
+                    handler_qname: if viewset.is_empty() {
+                        None
+                    } else {
+                        Some(viewset.to_string())
+                    },
+                });
+            }
+        }
+    }
+
+    // dedup by (line, path_pattern) — overlapping regexes may produce duplicates
+    endpoints.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then(a.path_pattern.cmp(&b.path_pattern))
+    });
+    endpoints.dedup_by(|a, b| a.line == b.line && a.path_pattern == b.path_pattern);
+
+    endpoints
+}
+
+/// Extract @action decorators and bind them to the following function
+pub fn extract_py_actions(content: &str) -> Vec<ExtractedEndpoint> {
+    let mut actions = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+
+        if let Some(caps) = PY_ACTION_RE.captures(trimmed) {
+            let params = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+
+            // parse @action parameters
+            let methods: Vec<String> = PY_ACTION_METHODS_RE
+                .captures(params)
+                .map(|mc| {
+                    let list = mc.get(1).map(|m| m.as_str()).unwrap_or("");
+                    list.split(',')
+                        .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_uppercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let url_path = PY_ACTION_URL_PATH_RE
+                .captures(params)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str().to_string());
+
+            let _detail = PY_ACTION_DETAIL_RE
+                .captures(params)
+                .and_then(|c| c.get(1))
+                .map(|m| m.as_str() == "True")
+                .unwrap_or(false);
+
+            // find the next def function name
+            let mut func_name = None;
+            for next_line in lines.iter().skip(i + 1).take(4) {
+                let next = next_line.trim();
+                if next.starts_with("def ") || next.starts_with("async def ") {
+                    let name_start = if next.starts_with("async def ") {
+                        "async def ".len()
+                    } else {
+                        "def ".len()
+                    };
+                    if let Some(paren) = next[name_start..].find('(') {
+                        func_name = Some(next[name_start..name_start + paren].to_string());
+                    }
+                    break;
+                }
+            }
+
+            let path = url_path
+                .as_deref()
+                .or(func_name.as_deref())
+                .unwrap_or("")
+                .to_string();
+
+            if methods.is_empty() {
+                // @action without methods defaults to GET
+                actions.push(ExtractedEndpoint {
+                    method: Some("GET".to_string()),
+                    path_pattern: path,
+                    line: i + 1,
+                    handler_qname: func_name.clone(),
+                });
+            } else {
+                for method in &methods {
+                    actions.push(ExtractedEndpoint {
+                        method: Some(method.clone()),
+                        path_pattern: path.clone(),
+                        line: i + 1,
+                        handler_qname: func_name.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    actions
+}
+
+/// Extract ModelSerializer.Meta.model relationships from file content
+pub fn extract_py_serializer_models(content: &str) -> Vec<ExtractedSerializerModel> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // state: which class and Meta scope we are currently inside
+    let mut current_class: Option<String> = None;
+    let mut in_meta = false;
+    let mut class_indent = 0;
+    let mut meta_indent = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        // skip blank lines and comments
+        if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+
+        // detect class Meta: inside serializer (before handling regular classes)
+        if current_class.is_some()
+            && stripped.starts_with("class Meta")
+            && stripped.contains(':')
+            && indent > class_indent
+        {
+            in_meta = true;
+            meta_indent = indent;
+            continue;
+        }
+
+        // detect class ... (with Serializer in bases)
+        if stripped.starts_with("class ") {
+            if stripped.contains("Serializer") {
+                // extract class name
+                if let Some(paren) = stripped.find('(') {
+                    let name = stripped["class ".len()..paren].trim();
+                    current_class = Some(name.to_string());
+                    class_indent = indent;
+                    in_meta = false;
+                } else if let Some(colon) = stripped.find(':') {
+                    let name = stripped["class ".len()..colon].trim();
+                    current_class = Some(name.to_string());
+                    class_indent = indent;
+                    in_meta = false;
+                }
+            } else if indent <= class_indent {
+                // new class at same/outer level -- reset
+                current_class = None;
+                in_meta = false;
+            }
+            continue;
+        }
+
+        // leaving class scope
+        if current_class.is_some() && indent <= class_indent && !stripped.is_empty() {
+            current_class = None;
+            in_meta = false;
+            continue;
+        }
+
+        if current_class.is_some() {
+            // leaving Meta scope
+            if in_meta && indent <= meta_indent && !stripped.is_empty() {
+                in_meta = false;
+            }
+
+            // inside Meta -- look for model = ...
+            if in_meta {
+                if let Some(caps) = PY_META_MODEL_RE.captures(stripped) {
+                    let model_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    if !model_name.is_empty() {
+                        // strip models. prefix
+                        let clean_model = model_name.rsplit('.').next().unwrap_or(model_name);
+                        results.push(ExtractedSerializerModel {
+                            serializer_name: current_class.clone().unwrap_or_default(),
+                            model_name: clean_model.to_string(),
+                            line: i + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract settings/env usages from file content
+pub fn extract_py_settings(content: &str) -> Vec<ExtractedSettingUsage> {
+    let mut results = Vec::new();
+    let mut current_func: Option<String> = None;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let line_num = line_num + 1;
+        let trimmed = line.trim();
+
+        // skip comments
+        if trimmed.starts_with('#') {
+            continue;
+        }
+
+        // track current function/method scope
+        if trimmed.starts_with("def ") || trimmed.starts_with("async def ") {
+            let start = if trimmed.starts_with("async def ") {
+                "async def ".len()
+            } else {
+                "def ".len()
+            };
+            if let Some(paren) = trimmed[start..].find('(') {
+                current_func = Some(trimmed[start..start + paren].to_string());
+            }
+        } else if trimmed.starts_with("class ") {
+            if let Some(end) = trimmed.find(['(', ':']) {
+                current_func = Some(trimmed["class ".len()..end].trim().to_string());
+            }
+        }
+
+        // settings.SOME_KEY
+        for caps in PY_SETTINGS_RE.captures_iter(line) {
+            let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !key.is_empty() {
+                results.push(ExtractedSettingUsage {
+                    key: key.to_string(),
+                    key_kind: "settings".to_string(),
+                    line: line_num,
+                    context_symbol: current_func.clone(),
+                });
+            }
+        }
+
+        // os.getenv/os.environ.get/os.environ[]
+        for caps in PY_GETENV_RE.captures_iter(line) {
+            let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !key.is_empty() {
+                results.push(ExtractedSettingUsage {
+                    key: key.to_string(),
+                    key_kind: "env".to_string(),
+                    line: line_num,
+                    context_symbol: current_func.clone(),
+                });
+            }
+        }
+
+        // env("KEY"), config("KEY")
+        for caps in PY_ENV_RE.captures_iter(line) {
+            let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !key.is_empty() {
+                results.push(ExtractedSettingUsage {
+                    key: key.to_string(),
+                    key_kind: "env".to_string(),
+                    line: line_num,
+                    context_symbol: current_func.clone(),
+                });
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract and persist Python framework facts for indexed files
+pub fn extract_py_facts(
+    conn: &mut Connection,
+    root: &Path,
+    progress: bool,
+) -> Result<(usize, usize, usize)> {
+    use crate::db;
+
+    // fetch all .py files from the index
+    let py_files: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare("SELECT id, path FROM files WHERE path LIKE '%.py'")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    if py_files.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    if progress {
+        eprintln!("Extracting Python facts from {} files...", py_files.len());
+    }
+
+    let mut endpoint_count = 0;
+    let mut serializer_count = 0;
+    let mut setting_count = 0;
+
+    let tx = conn.transaction()?;
+
+    for (file_id, rel_path) in &py_files {
+        let file_path = root.join(rel_path);
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // 1. Endpoints (urlpatterns + router.register)
+        let endpoints = extract_py_endpoints(&content);
+        for ep in &endpoints {
+            let ep_id = db::insert_py_endpoint(
+                &tx,
+                ep.method.as_deref(),
+                &ep.path_pattern,
+                *file_id,
+                ep.line,
+                ep.handler_qname.as_deref(),
+            )?;
+
+            // import-aware handler symbol resolution
+            if let Some(handler) = &ep.handler_qname {
+                let short_name = handler.rsplit('.').next().unwrap_or(handler);
+
+                let ep_import_map = build_py_import_map(&content);
+                let resolved = resolve_py_name_to_symbol(&tx, short_name, &ep_import_map);
+
+                if let Some((sid, _path)) = resolved {
+                    let confidence = if ep_import_map.iter().any(|imp| imp.local_name == short_name)
+                    {
+                        "high"
+                    } else {
+                        "medium"
+                    };
+                    db::insert_py_endpoint_handler(
+                        &tx,
+                        ep_id,
+                        sid,
+                        confidence,
+                        Some("urlpatterns/router.register import-aware"),
+                    )?;
+                }
+            }
+            endpoint_count += 1;
+        }
+
+        // @action endpoints
+        let actions = extract_py_actions(&content);
+        for ep in &actions {
+            let ep_id = db::insert_py_endpoint(
+                &tx,
+                ep.method.as_deref(),
+                &ep.path_pattern,
+                *file_id,
+                ep.line,
+                ep.handler_qname.as_deref(),
+            )?;
+
+            if let Some(handler) = &ep.handler_qname {
+                let sym_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                        rusqlite::params![handler, file_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(sid) = sym_id {
+                    db::insert_py_endpoint_handler(
+                        &tx,
+                        ep_id,
+                        sid,
+                        "high",
+                        Some("@action decorator"),
+                    )?;
+                }
+            }
+            endpoint_count += 1;
+        }
+
+        // 2. Serializer -> Model
+        let ser_models = extract_py_serializer_models(&content);
+        for sm in &ser_models {
+            // lookup symbol_id for serializer and model
+            let ser_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![sm.serializer_name, file_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let model_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 LIMIT 1",
+                    rusqlite::params![sm.model_name],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let (Some(sid), Some(mid)) = (ser_id, model_id) {
+                db::insert_py_serializer_model(&tx, sid, mid, "high", Some("Meta.model"))?;
+                serializer_count += 1;
+            }
+        }
+
+        // 2b. Handler -> Serializer direct links (serializer_class = X)
+        let handler_serializers = extract_py_handler_serializers(&content);
+        let import_map = build_py_import_map(&content);
+        for (class_name, serializer_name, _line) in &handler_serializers {
+            // find handler symbol_id in this file
+            let handler_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![class_name, file_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            // resolve serializer via imports
+            let serializer_info = resolve_py_name_to_symbol(&tx, serializer_name, &import_map);
+
+            if let (Some(h_id), Some((s_id, _s_path))) = (handler_id, serializer_info) {
+                let confidence = if import_map
+                    .iter()
+                    .any(|imp| imp.local_name == *serializer_name)
+                {
+                    "high"
+                } else {
+                    "medium"
+                };
+                db::insert_py_handler_serializer(
+                    &tx,
+                    h_id,
+                    s_id,
+                    confidence,
+                    Some("serializer_class"),
+                )?;
+            }
+        }
+
+        // 3. Settings/env usages
+        let settings = extract_py_settings(&content);
+        for su in &settings {
+            // bind to the nearest symbol (function/class) in the same file
+            let sym_id: Option<i64> = if let Some(ctx) = &su.context_symbol {
+                tx.query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![ctx, file_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            } else {
+                None
+            };
+
+            if let Some(sid) = sym_id {
+                db::insert_py_symbol_setting(
+                    &tx,
+                    sid,
+                    &su.key,
+                    &su.key_kind,
+                    "medium",
+                    Some(&format!("{}:{}", rel_path, su.line)),
+                )?;
+                setting_count += 1;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if progress {
+        eprintln!(
+            "Extracted {} endpoints, {} serializer-model links, {} settings usages",
+            endpoint_count, serializer_count, setting_count
+        );
+    }
+
+    Ok((endpoint_count, serializer_count, setting_count))
+}
+
+/// Incremental extraction of Python facts for changed files only.
+/// Currently unused; reserved for future incremental re-indexing support.
+#[allow(dead_code)]
+pub fn extract_py_facts_for_files(
+    conn: &mut Connection,
+    root: &Path,
+    file_ids: &[i64],
+    progress: bool,
+) -> Result<(usize, usize, usize)> {
+    use crate::db;
+
+    if file_ids.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    // delete old facts for these files
+    db::clear_py_facts_for_files(conn, file_ids)?;
+
+    // fetch paths for the given file_ids
+    let placeholders: Vec<String> = file_ids.iter().map(|_| "?".to_string()).collect();
+    let ph = placeholders.join(",");
+    let sql = format!(
+        "SELECT id, path FROM files WHERE id IN ({}) AND path LIKE '%.py'",
+        ph
+    );
+
+    let py_files: Vec<(i64, String)> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<Box<dyn rusqlite::types::ToSql>> = file_ids
+            .iter()
+            .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+
+    if py_files.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    if progress {
+        eprintln!(
+            "Re-extracting Python facts for {} changed files...",
+            py_files.len()
+        );
+    }
+
+    let mut endpoint_count = 0;
+    let mut serializer_count = 0;
+    let mut setting_count = 0;
+
+    let tx = conn.transaction()?;
+
+    for (file_id, rel_path) in &py_files {
+        let file_path = root.join(rel_path);
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        // same extraction steps as extract_py_facts
+        let endpoints = extract_py_endpoints(&content);
+        for ep in &endpoints {
+            let ep_id = db::insert_py_endpoint(
+                &tx,
+                ep.method.as_deref(),
+                &ep.path_pattern,
+                *file_id,
+                ep.line,
+                ep.handler_qname.as_deref(),
+            )?;
+
+            // import-aware handler symbol resolution
+            if let Some(handler) = &ep.handler_qname {
+                let short_name = handler.rsplit('.').next().unwrap_or(handler);
+
+                let ep_import_map = build_py_import_map(&content);
+                let resolved = resolve_py_name_to_symbol(&tx, short_name, &ep_import_map);
+
+                if let Some((sid, _path)) = resolved {
+                    let confidence = if ep_import_map.iter().any(|imp| imp.local_name == short_name)
+                    {
+                        "high"
+                    } else {
+                        "medium"
+                    };
+                    db::insert_py_endpoint_handler(
+                        &tx,
+                        ep_id,
+                        sid,
+                        confidence,
+                        Some("urlpatterns/router.register import-aware"),
+                    )?;
+                }
+            }
+            endpoint_count += 1;
+        }
+
+        let actions = extract_py_actions(&content);
+        for ep in &actions {
+            let ep_id = db::insert_py_endpoint(
+                &tx,
+                ep.method.as_deref(),
+                &ep.path_pattern,
+                *file_id,
+                ep.line,
+                ep.handler_qname.as_deref(),
+            )?;
+            if let Some(handler) = &ep.handler_qname {
+                let sym_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                        rusqlite::params![handler, file_id],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if let Some(sid) = sym_id {
+                    db::insert_py_endpoint_handler(
+                        &tx,
+                        ep_id,
+                        sid,
+                        "high",
+                        Some("@action decorator"),
+                    )?;
+                }
+            }
+            endpoint_count += 1;
+        }
+
+        let ser_models = extract_py_serializer_models(&content);
+        for sm in &ser_models {
+            let ser_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![sm.serializer_name, file_id],
+                    |row| row.get(0),
+                )
+                .ok();
+            let model_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 LIMIT 1",
+                    rusqlite::params![sm.model_name],
+                    |row| row.get(0),
+                )
+                .ok();
+            if let (Some(sid), Some(mid)) = (ser_id, model_id) {
+                db::insert_py_serializer_model(&tx, sid, mid, "high", Some("Meta.model"))?;
+                serializer_count += 1;
+            }
+        }
+
+        // 2b. Handler -> Serializer direct links (serializer_class = X)
+        let handler_serializers = extract_py_handler_serializers(&content);
+        let import_map = build_py_import_map(&content);
+        for (class_name, serializer_name, _line) in &handler_serializers {
+            // find handler symbol_id in this file
+            let handler_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![class_name, file_id],
+                    |row| row.get(0),
+                )
+                .ok();
+
+            // resolve serializer via imports
+            let serializer_info = resolve_py_name_to_symbol(&tx, serializer_name, &import_map);
+
+            if let (Some(h_id), Some((s_id, _s_path))) = (handler_id, serializer_info) {
+                let confidence = if import_map
+                    .iter()
+                    .any(|imp| imp.local_name == *serializer_name)
+                {
+                    "high"
+                } else {
+                    "medium"
+                };
+                db::insert_py_handler_serializer(
+                    &tx,
+                    h_id,
+                    s_id,
+                    confidence,
+                    Some("serializer_class"),
+                )?;
+            }
+        }
+
+        let settings = extract_py_settings(&content);
+        for su in &settings {
+            let sym_id: Option<i64> = if let Some(ctx) = &su.context_symbol {
+                tx.query_row(
+                    "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![ctx, file_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            } else {
+                None
+            };
+            if let Some(sid) = sym_id {
+                db::insert_py_symbol_setting(
+                    &tx,
+                    sid,
+                    &su.key,
+                    &su.key_kind,
+                    "medium",
+                    Some(&format!("{}:{}", rel_path, su.line)),
+                )?;
+                setting_count += 1;
+            }
+        }
+    }
+
+    tx.commit()?;
+
+    if progress {
+        eprintln!(
+            "Re-extracted {} endpoints, {} serializer-model, {} settings",
+            endpoint_count, serializer_count, setting_count
+        );
+    }
+
+    Ok((endpoint_count, serializer_count, setting_count))
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2260,7 +3543,11 @@ mod tests {
     fn test_parse_file_swift() {
         let dir = TempDir::new().unwrap();
         let swift_file = dir.path().join("Test.swift");
-        fs::write(&swift_file, "class MyView: UIView {\n    func setup() {}\n}\n").unwrap();
+        fs::write(
+            &swift_file,
+            "class MyView: UIView {\n    func setup() {}\n}\n",
+        )
+        .unwrap();
 
         let result = parse_file(dir.path(), &swift_file).unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "MyView"));
@@ -2271,10 +3558,928 @@ mod tests {
     fn test_parse_file_python() {
         let dir = TempDir::new().unwrap();
         let py_file = dir.path().join("test.py");
-        fs::write(&py_file, "class Service:\n    def process(self):\n        pass\n").unwrap();
+        fs::write(
+            &py_file,
+            "class Service:\n    def process(self):\n        pass\n",
+        )
+        .unwrap();
 
         let result = parse_file(dir.path(), &py_file).unwrap();
         assert!(result.symbols.iter().any(|s| s.name == "Service"));
         assert!(result.symbols.iter().any(|s| s.name == "process"));
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_django_urls() {
+        let content = r#"
+from django.urls import path, re_path
+from . import views
+
+urlpatterns = [
+    path("users/", views.UserListView.as_view(), name="user-list"),
+    path("users/<int:pk>/", views.UserDetailView.as_view(), name="user-detail"),
+    re_path(r"^api/v1/orders/$", views.order_list, name="order-list"),
+]
+"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(endpoints.len(), 3, "should extract 3 endpoints");
+        assert_eq!(endpoints[0].path_pattern, "users/");
+        assert_eq!(
+            endpoints[0].handler_qname.as_deref(),
+            Some("views.UserListView")
+        );
+        assert_eq!(endpoints[1].path_pattern, "users/<int:pk>/");
+        assert_eq!(endpoints[2].path_pattern, "^api/v1/orders/$");
+        assert_eq!(
+            endpoints[2].handler_qname.as_deref(),
+            Some("views.order_list")
+        );
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_router_register() {
+        let content = r#"
+from rest_framework.routers import DefaultRouter
+
+router = DefaultRouter()
+router.register(r"users", UserViewSet, basename="user")
+router.register(r"orders", OrderViewSet)
+"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(endpoints.len(), 2, "should extract 2 router registrations");
+        assert_eq!(endpoints[0].path_pattern, "users");
+        assert_eq!(endpoints[0].handler_qname.as_deref(), Some("UserViewSet"));
+        assert_eq!(endpoints[1].path_pattern, "orders");
+        assert_eq!(endpoints[1].handler_qname.as_deref(), Some("OrderViewSet"));
+    }
+
+    #[test]
+    fn test_extract_py_actions() {
+        let content = r#"
+class UserViewSet(ModelViewSet):
+    @action(detail=True, methods=["post", "get"], url_path="activate")
+    def activate_user(self, request, pk=None):
+        pass
+
+    @action(detail=False)
+    def bulk_delete(self, request):
+        pass
+"#;
+        let actions = extract_py_actions(content);
+        // first @action: 2 methods (POST, GET)
+        assert!(
+            actions.len() >= 3,
+            "should extract at least 3 action endpoints, got {}",
+            actions.len()
+        );
+
+        // POST activate
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.method.as_deref() == Some("POST") && a.path_pattern == "activate"),
+            "should have POST activate"
+        );
+        // GET activate
+        assert!(
+            actions
+                .iter()
+                .any(|a| a.method.as_deref() == Some("GET") && a.path_pattern == "activate"),
+            "should have GET activate"
+        );
+        // default GET for bulk_delete
+        assert!(
+            actions.iter().any(|a| a.method.as_deref() == Some("GET")
+                && a.handler_qname.as_deref() == Some("bulk_delete")),
+            "should have GET bulk_delete"
+        );
+    }
+
+    #[test]
+    fn test_extract_py_serializer_models() {
+        let content = r#"
+from rest_framework import serializers
+
+class UserSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = User
+        fields = "__all__"
+
+class OrderSerializer(serializers.Serializer):
+    amount = serializers.DecimalField()
+
+class ProfileSerializer(ModelSerializer):
+    class Meta:
+        model = models.Profile
+        fields = ["id", "bio"]
+"#;
+        let results = extract_py_serializer_models(content);
+        assert_eq!(results.len(), 2, "should extract 2 serializer-model links");
+        assert_eq!(results[0].serializer_name, "UserSerializer");
+        assert_eq!(results[0].model_name, "User");
+        assert_eq!(results[1].serializer_name, "ProfileSerializer");
+        assert_eq!(results[1].model_name, "Profile");
+    }
+
+    #[test]
+    fn test_extract_py_settings() {
+        let content = r#"
+from django.conf import settings
+import os
+
+def get_classification_host():
+    return settings.CLASSIFICATION_HOST
+
+def get_api_key():
+    key = os.getenv("API_KEY")
+    fallback = os.environ.get("FALLBACK_KEY")
+    return key or fallback
+
+class Config:
+    debug = settings.DEBUG
+    secret = env("SECRET_KEY")
+"#;
+        let results = extract_py_settings(content);
+
+        // settings.CLASSIFICATION_HOST
+        assert!(
+            results.iter().any(|s| s.key == "CLASSIFICATION_HOST"
+                && s.key_kind == "settings"
+                && s.context_symbol.as_deref() == Some("get_classification_host")),
+            "should find settings.CLASSIFICATION_HOST"
+        );
+
+        // os.getenv("API_KEY")
+        assert!(
+            results.iter().any(|s| s.key == "API_KEY"
+                && s.key_kind == "env"
+                && s.context_symbol.as_deref() == Some("get_api_key")),
+            "should find os.getenv API_KEY"
+        );
+
+        // os.environ.get("FALLBACK_KEY")
+        assert!(
+            results
+                .iter()
+                .any(|s| s.key == "FALLBACK_KEY" && s.key_kind == "env"),
+            "should find os.environ.get FALLBACK_KEY"
+        );
+
+        // settings.DEBUG
+        assert!(
+            results.iter().any(|s| s.key == "DEBUG"
+                && s.key_kind == "settings"
+                && s.context_symbol.as_deref() == Some("Config")),
+            "should find settings.DEBUG in Config class"
+        );
+
+        // env("SECRET_KEY")
+        assert!(
+            results
+                .iter()
+                .any(|s| s.key == "SECRET_KEY" && s.key_kind == "env"),
+            "should find env SECRET_KEY"
+        );
+    }
+
+    #[test]
+    fn test_extract_py_facts_integration() {
+        // integration test: create files, index, extract
+        let dir = TempDir::new().unwrap();
+
+        // urls.py
+        fs::write(
+            dir.path().join("urls.py"),
+            r#"
+from django.urls import path
+urlpatterns = [
+    path("api/users/", UserListView.as_view(), name="users"),
+]
+"#,
+        )
+        .unwrap();
+
+        // views.py with settings
+        fs::write(
+            dir.path().join("views.py"),
+            r#"
+from django.conf import settings
+
+class UserListView:
+    def get(self, request):
+        host = settings.API_HOST
+        return host
+"#,
+        )
+        .unwrap();
+
+        // serializers.py
+        fs::write(
+            dir.path().join("serializers.py"),
+            r#"
+class User:
+    pass
+
+class UserSerializer(ModelSerializer):
+    class Meta:
+        model = User
+        fields = "__all__"
+"#,
+        )
+        .unwrap();
+
+        // indexing
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+
+        // extraction
+        let (ep, sm, st) = extract_py_facts(&mut conn, dir.path(), false).unwrap();
+        assert!(ep > 0, "should extract at least 1 endpoint");
+        assert!(sm > 0, "should extract at least 1 serializer-model link");
+        assert!(st > 0, "should extract at least 1 setting usage");
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_skips_comments() {
+        let content = r#"
+# path("commented/", SomeView.as_view())
+urlpatterns = [
+    path("active/", ActiveView.as_view(), name="active"),
+]
+"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(endpoints.len(), 1, "should skip commented out paths");
+        assert_eq!(endpoints[0].path_pattern, "active/");
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_tuple_viewsets() {
+        let content = r#"
+view_sets = [
+    ("organization-performance", OrganizationPerformanceViewSet),
+    ("performance-filters", PerformanceFiltersViewSet),
+]
+"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0].path_pattern, "organization-performance");
+        assert_eq!(
+            endpoints[0].handler_qname.as_deref(),
+            Some("OrganizationPerformanceViewSet")
+        );
+        assert_eq!(endpoints[1].path_pattern, "performance-filters");
+        assert_eq!(
+            endpoints[1].handler_qname.as_deref(),
+            Some("PerformanceFiltersViewSet")
+        );
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_no_duplicates() {
+        let content = r#"router.register("users", UserViewSet)"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(
+            endpoints.len(),
+            1,
+            "should not create duplicates from overlapping regexes"
+        );
+    }
+
+    #[test]
+    fn test_extract_py_endpoints_tuple_no_false_positives() {
+        let content = r#"
+MODELS = [
+    ("users", UserModel),
+    ("posts", PostSerializer),
+]
+CHOICES = [
+    ("active", ActiveStatus),
+]
+"#;
+        let endpoints = extract_py_endpoints(content);
+        assert_eq!(
+            endpoints.len(),
+            0,
+            "should not match tuples without ViewSet/View suffix"
+        );
+    }
+
+    #[test]
+    fn test_extract_py_serializer_no_meta() {
+        let content = r#"
+class PlainSerializer(serializers.Serializer):
+    name = serializers.CharField()
+"#;
+        let results = extract_py_serializer_models(content);
+        assert!(
+            results.is_empty(),
+            "serializer without Meta should not be extracted"
+        );
+    }
+
+    // === Golden tests: JSON output stability for py.* commands ===
+
+    /// Golden test: py.routes JSON output
+    #[test]
+    fn test_golden_py_routes_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("urls.py"),
+            r#"
+from django.urls import path
+from rest_framework.routers import DefaultRouter
+from . import views
+
+urlpatterns = [
+    path("api/users/", views.UserListView.as_view(), name="user-list"),
+    path("api/orders/<int:pk>/", views.OrderDetailView.as_view(), name="order-detail"),
+]
+
+router = DefaultRouter()
+router.register(r"api/products", views.ProductViewSet, basename="product")
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        let (ep, _, _) = extract_py_facts(&mut conn, dir.path(), false).unwrap();
+        assert!(ep >= 3, "should extract at least 3 endpoints, got {}", ep);
+
+        let endpoints = crate::db::get_py_endpoints(&conn, None, 100).unwrap();
+        let json = serde_json::to_string_pretty(&endpoints).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        // verify structure of each item
+        for item in arr {
+            assert!(
+                item.get("path_pattern").is_some(),
+                "path_pattern is required"
+            );
+            assert!(item.get("file_path").is_some(), "file_path is required");
+            assert!(item.get("line").is_some(), "line is required");
+            assert!(item.get("id").is_some(), "id is required");
+        }
+
+        // verify specific endpoints
+        let patterns: Vec<&str> = arr
+            .iter()
+            .map(|v| v["path_pattern"].as_str().unwrap())
+            .collect();
+        assert!(
+            patterns.contains(&"api/orders/<int:pk>/"),
+            "should contain api/orders/<int:pk>/"
+        );
+        assert!(
+            patterns.contains(&"api/users/"),
+            "should contain api/users/"
+        );
+        assert!(
+            patterns.contains(&"api/products"),
+            "should contain api/products (router)"
+        );
+    }
+
+    /// Golden test: py.endpoint-trace JSON output structure
+    #[test]
+    fn test_golden_py_endpoint_trace_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("urls.py"),
+            r#"
+from django.urls import path
+urlpatterns = [
+    path("api/users/", UserListView.as_view(), name="users"),
+]
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("views.py"),
+            r#"
+from django.conf import settings
+
+class UserListView:
+    serializer_class = UserSerializer
+
+    def get(self, request):
+        host = settings.API_HOST
+        return host
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("models.py"),
+            r#"
+class User:
+    name = "user"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("serializers.py"),
+            r#"
+class UserSerializer(ModelSerializer):
+    class Meta:
+        model = User
+        fields = "__all__"
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        let (ep, sm, st) = extract_py_facts(&mut conn, dir.path(), false).unwrap();
+        assert!(ep >= 1, "should extract endpoint");
+        assert!(sm >= 1, "should extract serializer-model");
+        assert!(st >= 1, "should extract setting");
+
+        // verify trace JSON structure via DB API
+        let endpoints = crate::db::find_py_endpoint(&conn, None, "api/users").unwrap();
+        assert!(!endpoints.is_empty(), "should find endpoint by pattern");
+        let ep = &endpoints[0];
+
+        let handler = crate::db::get_py_endpoint_handler(&conn, ep.id).unwrap();
+        assert!(handler.is_some(), "handler should be found");
+        let h = handler.unwrap();
+        assert_eq!(h.name, "UserListView");
+
+        // settings: API_HOST is bound to method get(), not to class UserListView
+        // verify the setting exists in DB
+        let all_settings = crate::db::find_py_setting_usages(&conn, "API_HOST", 100).unwrap();
+        assert!(
+            !all_settings.is_empty(),
+            "API_HOST should be in py_symbol_settings"
+        );
+        assert_eq!(all_settings[0].key, "API_HOST");
+        assert_eq!(all_settings[0].key_kind, "settings");
+    }
+
+    /// Golden test: py.setting-usage JSON output structure
+    #[test]
+    fn test_golden_py_setting_usage_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("config.py"),
+            r#"
+import os
+from django.conf import settings
+
+def get_db_config():
+    url = os.getenv("DATABASE_URL")
+    host = settings.DATABASE_HOST
+    return url, host
+
+class AppConfig:
+    secret = os.environ.get("SECRET_KEY")
+    debug = settings.DEBUG
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        let (_, _, st) = extract_py_facts(&mut conn, dir.path(), false).unwrap();
+        assert!(st >= 4, "should extract at least 4 settings, got {}", st);
+
+        let usages = crate::db::find_py_setting_usages(&conn, "DATABASE", 100).unwrap();
+        let json = serde_json::to_string_pretty(&usages).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        // verify JSON structure
+        for item in arr {
+            assert!(item.get("key").is_some(), "key is required");
+            assert!(item.get("key_kind").is_some(), "key_kind is required");
+            assert!(item.get("symbol_name").is_some(), "symbol_name is required");
+            assert!(item.get("file_path").is_some(), "file_path is required");
+            assert!(item.get("line").is_some(), "line is required");
+            assert!(item.get("confidence").is_some(), "confidence is required");
+        }
+
+        // verify specific values
+        let keys: Vec<&str> = arr.iter().map(|v| v["key"].as_str().unwrap()).collect();
+        assert!(
+            keys.contains(&"DATABASE_URL"),
+            "should contain DATABASE_URL"
+        );
+        assert!(
+            keys.contains(&"DATABASE_HOST"),
+            "should contain DATABASE_HOST"
+        );
+
+        // exact search
+        let secret = crate::db::find_py_setting_usages(&conn, "SECRET_KEY", 100).unwrap();
+        assert_eq!(secret.len(), 1, "SECRET_KEY should be found exactly once");
+        assert_eq!(secret[0].key_kind, "env");
+    }
+
+    /// Regression: deleted file must not leave stale py_* facts (CASCADE)
+    #[test]
+    fn test_stale_py_facts_cleanup_on_file_delete() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        // create file and endpoints
+        let file_id = crate::db::upsert_file(&conn, "urls.py", 500, 50).unwrap();
+        let sym_id = crate::db::insert_symbol(
+            &conn,
+            file_id,
+            "UserView",
+            crate::db::SymbolKind::Class,
+            5,
+            Some("class UserView"),
+        )
+        .unwrap();
+
+        let ep_id = crate::db::insert_py_endpoint(
+            &conn,
+            Some("GET"),
+            "/api/users/",
+            file_id,
+            3,
+            Some("UserView"),
+        )
+        .unwrap();
+
+        crate::db::insert_py_endpoint_handler(&conn, ep_id, sym_id, "high", None).unwrap();
+        crate::db::insert_py_symbol_setting(&conn, sym_id, "API_KEY", "settings", "medium", None)
+            .unwrap();
+
+        // verify data exists
+        let eps = crate::db::get_py_endpoints(&conn, None, 100).unwrap();
+        assert_eq!(eps.len(), 1);
+        let settings = crate::db::get_py_symbol_settings(&conn, sym_id).unwrap();
+        assert_eq!(settings.len(), 1);
+
+        // delete file (CASCADE) -- simulates delete-on-update
+        conn.execute(
+            "DELETE FROM files WHERE id = ?1",
+            rusqlite::params![file_id],
+        )
+        .unwrap();
+
+        // all py_* facts should be deleted via CASCADE
+        let eps = crate::db::get_py_endpoints(&conn, None, 100).unwrap();
+        assert!(eps.is_empty(), "endpoints should be deleted via CASCADE");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM py_endpoint_handlers", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "endpoint_handlers should be deleted via CASCADE");
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM py_symbol_settings", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "symbol_settings should be deleted via CASCADE");
+    }
+
+    /// Golden test: py.model-impact JSON structure
+    #[test]
+    fn test_golden_py_model_impact_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("models.py"),
+            r#"
+class Order:
+    customer = "fk"
+    total = "decimal"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("serializers.py"),
+            r#"
+class OrderSerializer(ModelSerializer):
+    class Meta:
+        model = Order
+        fields = "__all__"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("views.py"),
+            r#"
+class OrderViewSet:
+    serializer_class = OrderSerializer
+
+    def list(self, request):
+        pass
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("urls.py"),
+            r#"
+from rest_framework.routers import DefaultRouter
+router = DefaultRouter()
+router.register(r"orders", OrderViewSet)
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        extract_py_facts(&mut conn, dir.path(), false).unwrap();
+
+        // model-impact: Order -> OrderSerializer -> OrderViewSet -> /orders/
+        let impacts = crate::db::find_py_model_symbols(&conn, "Order", 5).unwrap();
+        assert!(!impacts.is_empty(), "should find Order model");
+        assert_eq!(impacts[0].name, "Order");
+        assert!(
+            impacts[0].path.contains("models.py"),
+            "Order should be in models.py"
+        );
+
+        let serializers = crate::db::find_py_serializers_for_model(&conn, "Order").unwrap();
+        assert!(!serializers.is_empty(), "should find serializer for Order");
+        assert_eq!(serializers[0].1.name, "OrderSerializer");
+
+        let handlers = crate::db::find_py_handlers_for_serializer(&conn, serializers[0].0).unwrap();
+        assert!(
+            !handlers.is_empty(),
+            "should find handler for OrderSerializer"
+        );
+        assert_eq!(handlers[0].1.name, "OrderViewSet");
+
+        let endpoints = crate::db::find_py_endpoints_for_handler(&conn, handlers[0].0).unwrap();
+        assert!(
+            !endpoints.is_empty(),
+            "should find endpoint for OrderViewSet"
+        );
+        assert!(endpoints[0].path_pattern.contains("orders"));
+    }
+
+    /// Golden test: bundle JSON structure (endpoint seed)
+    #[test]
+    fn test_golden_bundle_endpoint_json() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("models.py"),
+            r#"
+class Product:
+    name = "str"
+    price = "decimal"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("serializers.py"),
+            r#"
+class ProductSerializer(ModelSerializer):
+    class Meta:
+        model = Product
+        fields = "__all__"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("views.py"),
+            r#"
+from django.conf import settings
+
+class ProductViewSet:
+    serializer_class = ProductSerializer
+
+    def list(self, request):
+        limit = settings.PAGE_SIZE
+        return limit
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("urls.py"),
+            r#"
+from rest_framework.routers import DefaultRouter
+router = DefaultRouter()
+router.register(r"products", ProductViewSet)
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        extract_py_facts(&mut conn, dir.path(), false).unwrap();
+
+        // bundle: endpoint seed "products"
+        let items = crate::commands::bundle::bundle_endpoint(&conn, "products", None, 50).unwrap();
+
+        assert!(!items.is_empty(), "bundle should have items");
+
+        // check JSON serialization roundtrip
+        let json = serde_json::to_string_pretty(&items).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        for item in arr {
+            assert!(item.get("path").is_some(), "path required");
+            assert!(item.get("line").is_some(), "line required");
+            assert!(item.get("kind").is_some(), "kind required");
+            assert!(item.get("reason").is_some(), "reason required");
+            assert!(item.get("confidence").is_some(), "confidence required");
+        }
+
+        // check that different kinds are present
+        let kinds: Vec<&str> = arr.iter().map(|v| v["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"endpoint"));
+        assert!(kinds.contains(&"handler"));
+    }
+
+    /// Regression: duplicate model names — model-impact should prefer models.py
+    #[test]
+    fn test_regression_duplicate_model_names() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        // User in models.py (should be preferred)
+        let models_id = crate::db::upsert_file(&conn, "app/models.py", 500, 50).unwrap();
+        let _model_id = crate::db::insert_symbol(
+            &conn,
+            models_id,
+            "User",
+            crate::db::SymbolKind::Class,
+            10,
+            Some("class User(Model)"),
+        )
+        .unwrap();
+
+        // User in utils.py (should NOT be preferred)
+        let utils_id = crate::db::upsert_file(&conn, "app/utils.py", 300, 30).unwrap();
+        let _other_id = crate::db::insert_symbol(
+            &conn,
+            utils_id,
+            "User",
+            crate::db::SymbolKind::Class,
+            5,
+            Some("class User"),
+        )
+        .unwrap();
+
+        let results = crate::db::find_py_model_symbols(&conn, "User", 5).unwrap();
+        assert_eq!(results.len(), 2);
+        // models.py should come first
+        assert!(
+            results[0].path.contains("models.py"),
+            "models.py should be preferred: got {}",
+            results[0].path
+        );
+    }
+
+    /// Regression: serializer ambiguity — handler with serializer_class picks the right one
+    #[test]
+    fn test_regression_serializer_ambiguity() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("serializers.py"),
+            r#"
+class UserSerializer(ModelSerializer):
+    class Meta:
+        model = User
+        fields = "__all__"
+
+class AdminSerializer(ModelSerializer):
+    class Meta:
+        model = Admin
+        fields = "__all__"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("views.py"),
+            r#"
+class UserViewSet:
+    serializer_class = UserSerializer
+"#,
+        )
+        .unwrap();
+
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+        index_directory(&mut conn, dir.path(), false, true).unwrap();
+        extract_py_facts(&mut conn, dir.path(), false).unwrap();
+
+        // find handler symbol_id
+        let syms = crate::db::find_symbols_by_name(&conn, "UserViewSet", None, 1).unwrap();
+        assert!(!syms.is_empty(), "UserViewSet should exist");
+
+        let handler_id: i64 = conn
+            .query_row(
+                "SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = 'UserViewSet' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        // handler -> serializer should be UserSerializer (not AdminSerializer)
+        let ser = crate::db::get_py_handler_serializer(&conn, handler_id).unwrap();
+        assert!(ser.is_some(), "should find serializer for handler");
+        let (_, ser_result, _) = ser.unwrap();
+        assert_eq!(
+            ser_result.name, "UserSerializer",
+            "should pick UserSerializer, not AdminSerializer"
+        );
+    }
+
+    /// Golden test: bundle model seed JSON structure
+    #[test]
+    fn test_golden_bundle_model_json() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::init_db(&conn).unwrap();
+
+        let models_id = crate::db::upsert_file(&conn, "models.py", 500, 50).unwrap();
+        let ser_id_f = crate::db::upsert_file(&conn, "serializers.py", 800, 80).unwrap();
+        let views_id = crate::db::upsert_file(&conn, "views.py", 1000, 100).unwrap();
+        let urls_id = crate::db::upsert_file(&conn, "urls.py", 400, 40).unwrap();
+
+        let model_sym = crate::db::insert_symbol(
+            &conn,
+            models_id,
+            "Invoice",
+            crate::db::SymbolKind::Class,
+            5,
+            Some("class Invoice(Model)"),
+        )
+        .unwrap();
+        let ser_sym = crate::db::insert_symbol(
+            &conn,
+            ser_id_f,
+            "InvoiceSerializer",
+            crate::db::SymbolKind::Class,
+            3,
+            Some("class InvoiceSerializer(ModelSerializer)"),
+        )
+        .unwrap();
+        let handler_sym = crate::db::insert_symbol(
+            &conn,
+            views_id,
+            "InvoiceViewSet",
+            crate::db::SymbolKind::Class,
+            8,
+            Some("class InvoiceViewSet(ModelViewSet)"),
+        )
+        .unwrap();
+
+        crate::db::insert_py_serializer_model(
+            &conn,
+            ser_sym,
+            model_sym,
+            "high",
+            Some("Meta.model"),
+        )
+        .unwrap();
+        crate::db::insert_py_handler_serializer(
+            &conn,
+            handler_sym,
+            ser_sym,
+            "high",
+            Some("serializer_class"),
+        )
+        .unwrap();
+
+        let ep_id = crate::db::insert_py_endpoint(
+            &conn,
+            Some("GET"),
+            "/api/invoices/",
+            urls_id,
+            5,
+            Some("InvoiceViewSet"),
+        )
+        .unwrap();
+        crate::db::insert_py_endpoint_handler(
+            &conn,
+            ep_id,
+            handler_sym,
+            "high",
+            Some("router.register"),
+        )
+        .unwrap();
+
+        let items = crate::commands::bundle::bundle_model(&conn, "Invoice", 50).unwrap();
+        assert!(!items.is_empty());
+
+        let json = serde_json::to_string_pretty(&items).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().unwrap();
+
+        let kinds: Vec<&str> = arr.iter().map(|v| v["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"model"), "should contain model");
+        assert!(kinds.contains(&"serializer"), "should contain serializer");
+        assert!(kinds.contains(&"handler"), "should contain handler");
+        assert!(kinds.contains(&"endpoint"), "should contain endpoint");
+
+        // deterministic: same result on second call
+        let items2 = crate::commands::bundle::bundle_model(&conn, "Invoice", 50).unwrap();
+        assert_eq!(items, items2, "bundle must be deterministic");
     }
 }
