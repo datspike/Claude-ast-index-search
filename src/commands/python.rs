@@ -13,7 +13,7 @@ use colored::Colorize;
 use crate::db;
 
 /// List Python endpoints (Django/DRF routes)
-pub fn cmd_py_routes(root: &Path, limit: usize, format: &str) -> Result<()> {
+pub fn cmd_py_routes(root: &Path, query: Option<&str>, limit: usize, format: &str) -> Result<()> {
     let start = Instant::now();
 
     if !db::db_exists(root) {
@@ -25,17 +25,27 @@ pub fn cmd_py_routes(root: &Path, limit: usize, format: &str) -> Result<()> {
     }
 
     let conn = db::open_db(root)?;
-    let endpoints = db::get_py_endpoints(&conn, None, limit)?;
+    let total = db::count_py_endpoints(&conn, query)?;
+    let endpoints = db::get_py_endpoints(&conn, query, limit)?;
 
     if format == "json" {
         println!("{}", serde_json::to_string_pretty(&endpoints)?);
+        if endpoints.len() < total {
+            eprintln!(
+                "{}",
+                format!(
+                    "Showing {} of {} routes. Use --limit {} to show all.",
+                    endpoints.len(),
+                    total,
+                    total
+                )
+                .dimmed()
+            );
+        }
         return Ok(());
     }
 
-    println!(
-        "{}",
-        format!("Python routes ({} found):", endpoints.len()).bold()
-    );
+    println!("{}", format!("Python routes ({} found):", total).bold());
 
     if endpoints.is_empty() {
         println!("  No routes found. Run 'ast-index rebuild' on a Django/DRF project.");
@@ -59,6 +69,18 @@ pub fn cmd_py_routes(root: &Path, limit: usize, format: &str) -> Result<()> {
             confidence.dimmed(),
             ep.file_path,
             ep.line,
+        );
+    }
+
+    if endpoints.len() < total {
+        println!(
+            "  {}",
+            format!(
+                "... and {} more. Use --limit {} to show all.",
+                total - endpoints.len(),
+                total
+            )
+            .dimmed()
         );
     }
 
@@ -101,7 +123,7 @@ pub fn cmd_py_endpoint_trace(
     for ep in endpoints {
         let handler = db::get_py_endpoint_handler(&conn, ep.id)?;
 
-        // serializer and model: lookup via handler symbol_id
+        // serializer and model: look up via handler symbol_id
         let handler_symbol_id = get_handler_symbol_id(&conn, ep.id);
         let (serializer, model) = if let Some(h_id) = handler_symbol_id {
             // find serializer linked to handler, then resolve model through py_serializer_models
@@ -237,6 +259,124 @@ pub fn cmd_py_setting_usage(root: &Path, key: &str, limit: usize, format: &str) 
     Ok(())
 }
 
+/// Blast radius for a model: model -> serializers -> handlers -> endpoints
+pub fn cmd_py_model_impact(root: &Path, name: &str, limit: usize, format: &str) -> Result<()> {
+    let start = Instant::now();
+
+    if !db::db_exists(root) {
+        println!(
+            "{}",
+            "Index not found. Run 'ast-index rebuild' first.".red()
+        );
+        return Ok(());
+    }
+
+    let conn = db::open_db(root)?;
+    let models = db::find_py_model_symbols(&conn, name, limit)?;
+
+    if models.is_empty() {
+        if format == "json" {
+            println!("[]");
+        } else {
+            println!("No model '{}' found in the index.", name);
+        }
+        return Ok(());
+    }
+
+    let mut impacts: Vec<db::PyModelImpact> = Vec::new();
+
+    for model in models {
+        let serializers_raw = db::find_py_serializers_for_model(&conn, &model.name)?;
+
+        let mut serializers = Vec::new();
+        for (ser_id, ser_result, confidence) in serializers_raw {
+            let handlers_raw = db::find_py_handlers_for_serializer(&conn, ser_id)?;
+
+            let mut handlers = Vec::new();
+            for (handler_id, handler_result) in handlers_raw {
+                let endpoints = db::find_py_endpoints_for_handler(&conn, handler_id)?;
+                handlers.push(db::PyModelHandlerImpact {
+                    handler: handler_result,
+                    endpoints,
+                });
+            }
+
+            serializers.push(db::PyModelSerializerImpact {
+                serializer: ser_result,
+                confidence,
+                handlers,
+            });
+        }
+
+        impacts.push(db::PyModelImpact { model, serializers });
+    }
+
+    if format == "json" {
+        println!("{}", serde_json::to_string_pretty(&impacts)?);
+        return Ok(());
+    }
+
+    for impact in &impacts {
+        println!(
+            "{}",
+            format!(
+                "Model: {} ({}:{})",
+                impact.model.name, impact.model.path, impact.model.line
+            )
+            .bold()
+        );
+
+        if impact.serializers.is_empty() {
+            println!("  (no serializers found)");
+            println!();
+            continue;
+        }
+
+        for ser in &impact.serializers {
+            println!(
+                "  serializer: {} [{}] {}:{}",
+                ser.serializer.name.cyan(),
+                ser.confidence,
+                ser.serializer.path,
+                ser.serializer.line,
+            );
+
+            if ser.handlers.is_empty() {
+                println!("    (no handlers found)");
+                continue;
+            }
+
+            for h in &ser.handlers {
+                println!(
+                    "    handler: {} {}:{}",
+                    h.handler.name.green(),
+                    h.handler.path,
+                    h.handler.line,
+                );
+
+                for ep in &h.endpoints {
+                    let method = ep.method.as_deref().unwrap_or("*");
+                    println!(
+                        "      {} {} ({}:{})",
+                        method.yellow(),
+                        ep.path_pattern,
+                        ep.file_path,
+                        ep.line,
+                    );
+                }
+
+                if h.endpoints.is_empty() {
+                    println!("      (no endpoints found)");
+                }
+            }
+        }
+        println!();
+    }
+
+    eprintln!("{}", format!("Time: {:?}", start.elapsed()).dimmed());
+    Ok(())
+}
+
 /// Get handler symbol_id for an endpoint
 fn get_handler_symbol_id(conn: &rusqlite::Connection, endpoint_id: i64) -> Option<i64> {
     conn.query_row(
@@ -249,15 +389,20 @@ fn get_handler_symbol_id(conn: &rusqlite::Connection, endpoint_id: i64) -> Optio
 
 /// Find serializer -> model chain for a handler symbol_id.
 ///
-/// Handler may reference a serializer via refs (serializer_class = ...).
-/// We look for serializer symbols that have a model link through py_serializer_models.
+/// Strategy: py_handler_serializers (direct link) first, then refs-based fallback.
 fn find_serializer_model_chain(
     conn: &rusqlite::Connection,
     handler_symbol_id: i64,
 ) -> (Option<db::SearchResult>, Option<db::SearchResult>) {
-    // handler -> refs contain serializer name -> py_serializer_models link serializer to model
+    // Primary: py_handler_serializers (direct link from serializer_class = X)
+    if let Ok(Some((ser_id, ser_result, _confidence))) =
+        db::get_py_handler_serializer(conn, handler_symbol_id)
+    {
+        let model = db::get_py_serializer_model(conn, ser_id).unwrap_or(None);
+        return (Some(ser_result), model);
+    }
 
-    // step 1: get handler refs (names it references)
+    // Fallback: refs-based search (serializer mentioned in handler's file)
     let handler_refs: Vec<(String, i64)> = conn
         .prepare(
             r#"
@@ -283,7 +428,6 @@ fn find_serializer_model_chain(
         .unwrap_or_default();
 
     if let Some((_name, serializer_id)) = handler_refs.first() {
-        // serializer found — get SearchResult
         let serializer = conn
             .query_row(
                 r#"
@@ -306,7 +450,6 @@ fn find_serializer_model_chain(
             .ok();
 
         let model = db::get_py_serializer_model(conn, *serializer_id).unwrap_or(None);
-
         (serializer, model)
     } else {
         (None, None)
@@ -389,7 +532,7 @@ mod tests {
         )
         .unwrap();
 
-        // handler refs -> UserSerializer (simulated ref in the same file)
+        // handler refs -> UserSerializer (simulating ref in the same file)
         conn.execute(
             "INSERT INTO refs (file_id, name, line, context) VALUES (?1, ?2, ?3, ?4)",
             rusqlite::params![
@@ -457,7 +600,10 @@ mod tests {
         );
         assert_eq!(serializer.unwrap().name, "UserSerializer");
 
-        assert!(model.is_some(), "model should be found via py_serializer_models");
+        assert!(
+            model.is_some(),
+            "model should be found via py_serializer_models"
+        );
         assert_eq!(model.unwrap().name, "User");
     }
 
@@ -547,11 +693,11 @@ mod tests {
         )
         .unwrap();
 
-        // search by substring DATABASE
+        // substring search for DATABASE
         let usages = db::find_py_setting_usages(&conn, "DATABASE", 100).unwrap();
         assert_eq!(usages.len(), 2);
 
-        // exact search
+        // exact match
         let usages = db::find_py_setting_usages(&conn, "DATABASE_URL", 100).unwrap();
         assert_eq!(usages.len(), 1);
         assert_eq!(usages[0].key_kind, "env");

@@ -82,6 +82,10 @@ Python (Django/DRF):
   py.routes              List Python endpoints (routes)
   py.endpoint-trace      Trace endpoint -> handler -> serializer -> model -> settings
   py.setting-usage       Find settings/env key usages
+  py.model-impact        Show blast radius for a model (serializers, handlers, endpoints)
+
+Context Bundles:
+  bundle                 Collect context bundle by seed (endpoint/model/setting/symbol)
 
 Project Insights:
   map                    Show compact project map (key types per directory)
@@ -558,6 +562,8 @@ enum Commands {
     /// List Python endpoints (Django/DRF routes)
     #[command(name = "py.routes")]
     PyRoutes {
+        /// Filter by path or handler (substring match)
+        query: Option<String>,
         /// Max results
         #[arg(short, long, default_value = "100")]
         limit: usize,
@@ -579,6 +585,34 @@ enum Commands {
         /// Max results
         #[arg(short, long, default_value = "50")]
         limit: usize,
+    },
+    /// Show blast radius for a Django model (serializers, handlers, endpoints)
+    #[command(name = "py.model-impact")]
+    PyModelImpact {
+        /// Model class name (exact match)
+        name: String,
+        /// Max model matches
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
+    // === Bundle ===
+    /// Collect deterministic context bundle by seed type
+    Bundle {
+        /// Seed type: endpoint, model, setting, symbol
+        #[arg(long)]
+        seed_type: String,
+        /// Seed value (path pattern, model name, setting key, or symbol name)
+        #[arg(long)]
+        seed: String,
+        /// HTTP method filter (for endpoint seed)
+        #[arg(long)]
+        method: Option<String>,
+        /// Max items in bundle
+        #[arg(long, default_value = "50")]
+        max_items: usize,
+        /// Max unique files in bundle (0 = unlimited)
+        #[arg(long, default_value = "0")]
+        max_files: usize,
     },
     // === Project Insights ===
     /// Show compact project map (key types per directory)
@@ -850,13 +884,34 @@ fn main() -> Result<()> {
         Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
         Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
         // Python commands
-        Commands::PyRoutes { limit } => commands::python::cmd_py_routes(&root, limit, format),
+        Commands::PyRoutes { query, limit } => {
+            commands::python::cmd_py_routes(&root, query.as_deref(), limit, format)
+        }
         Commands::PyEndpointTrace { path_pattern, method } => {
             commands::python::cmd_py_endpoint_trace(&root, method.as_deref(), &path_pattern, format)
         }
         Commands::PySettingUsage { key, limit } => {
             commands::python::cmd_py_setting_usage(&root, &key, limit, format)
         }
+        Commands::PyModelImpact { name, limit } => {
+            commands::python::cmd_py_model_impact(&root, &name, limit, format)
+        }
+        // Bundle
+        Commands::Bundle {
+            seed_type,
+            seed,
+            method,
+            max_items,
+            max_files,
+        } => commands::bundle::cmd_bundle(
+            &root,
+            &seed_type,
+            &seed,
+            method.as_deref(),
+            max_items,
+            max_files,
+            format,
+        ),
         // Project insights
         Commands::Map { module, per_dir, limit } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
         Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
