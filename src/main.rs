@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ast_index::{db, commands};
 
@@ -104,6 +104,10 @@ struct Cli {
     /// Output format: text or json
     #[arg(long, global = true, default_value = "text")]
     format: String,
+
+    /// Path to index database file (overrides auto-detection)
+    #[arg(long, global = true)]
+    index_path: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -621,11 +625,21 @@ enum Commands {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // --index-path: use specified index instead of auto-detection
+    if let Some(ref index_path) = cli.index_path {
+        let resolved = resolve_index_path(index_path)?;
+        // Safety: edition 2021, single-threaded main before command dispatch
+        std::env::set_var("AST_INDEX_DB_PATH", &resolved);
+    }
+
     let root = find_project_root()?;
     let format = cli.format.as_str();
 
-    // Migrate project DB from old kotlin-index to ast-index
-    db::migrate_legacy_project(&root);
+    // skip legacy migration when using custom index
+    if cli.index_path.is_none() {
+        db::migrate_legacy_project(&root);
+    }
 
     // Compute directory scope: if cwd is inside project root, limit search to cwd subtree
     let cwd = std::env::current_dir().unwrap_or_default();
@@ -801,6 +815,36 @@ fn cmd_install_claude_plugin() -> Result<()> {
     Ok(())
 }
 
+/// Resolve index path: canonicalize + validate
+fn resolve_index_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_relative() {
+        std::env::current_dir()?.join(path)
+    } else {
+        path.to_path_buf()
+    };
+
+    // existing file: full canonicalization (resolve symlinks)
+    if absolute.exists() {
+        return Ok(std::fs::canonicalize(&absolute)?);
+    }
+
+    // non-existent file (rebuild scenario): canonicalize parent + join filename
+    if let Some(parent) = absolute.parent() {
+        if !parent.exists() {
+            anyhow::bail!(
+                "Directory does not exist: {}\nCreate the directory or specify an existing path.",
+                parent.display()
+            );
+        }
+        let canonical_parent = std::fs::canonicalize(parent)?;
+        if let Some(filename) = absolute.file_name() {
+            return Ok(canonical_parent.join(filename));
+        }
+    }
+
+    Ok(absolute)
+}
+
 fn find_project_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     for ancestor in cwd.ancestors() {
@@ -835,4 +879,73 @@ fn find_project_root() -> Result<PathBuf> {
         }
     }
     Ok(cwd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_resolve_index_path_absolute_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("index.db");
+        std::fs::File::create(&db_file).unwrap();
+
+        let resolved = resolve_index_path(&db_file).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, std::fs::canonicalize(&db_file).unwrap());
+    }
+
+    #[test]
+    fn test_resolve_index_path_nonexistent_valid_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("new_index.db");
+
+        let resolved = resolve_index_path(&db_file).unwrap();
+        assert!(resolved.is_absolute());
+        assert!(resolved.ends_with("new_index.db"));
+    }
+
+    #[test]
+    fn test_resolve_index_path_nonexistent_parent() {
+        let path = PathBuf::from("/nonexistent_dir_12345/sub/index.db");
+        let result = resolve_index_path(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_resolve_index_path_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("index.db");
+        std::fs::File::create(&db_file).unwrap();
+
+        let cwd = std::env::current_dir().unwrap();
+        if let Ok(rel) = db_file.strip_prefix(&cwd) {
+            let resolved = resolve_index_path(rel).unwrap();
+            assert!(resolved.is_absolute());
+        }
+    }
+
+    #[test]
+    fn test_env_var_bridge_sets_ast_index_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("test.db");
+        std::fs::File::create(&db_file).unwrap();
+
+        // save original value
+        let original = std::env::var("AST_INDEX_DB_PATH").ok();
+
+        let resolved = resolve_index_path(&db_file).unwrap();
+        std::env::set_var("AST_INDEX_DB_PATH", &resolved);
+
+        let result = crate::db::get_db_path(Path::new("/dummy"));
+        assert_eq!(result.unwrap(), resolved);
+
+        // restore original value
+        match original {
+            Some(val) => std::env::set_var("AST_INDEX_DB_PATH", val),
+            None => std::env::remove_var("AST_INDEX_DB_PATH"),
+        }
+    }
+
 }

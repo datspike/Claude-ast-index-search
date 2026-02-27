@@ -166,8 +166,16 @@ ast-index perl-imports [QUERY]       # Find use/require statements
 ast-index init                     # Initialize DB
 ast-index rebuild [--type TYPE]    # Full reindex
 ast-index update                   # Incremental update
+ast-index restore <PATH>           # Restore index from .db file
 ast-index stats                    # Index statistics
 ast-index version                  # Version info
+```
+
+### Global flags
+
+```bash
+ast-index --index-path /path/to/index.db <COMMAND>  # Use custom index file
+ast-index --format json <COMMAND>                    # JSON output
 ```
 
 ## Language-Specific Features
@@ -387,6 +395,7 @@ ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
 
 ### 3.16.0
 - **`restore` command** — restore index from a `.db` file: `ast-index restore /path/to/index.db`
+- **`--index-path` flag** — use custom index database: `ast-index --index-path /path/to/index.db stats`
 
 ### 3.15.0
 - **TypeScript class members** — index class methods (constructor, getters/setters, static, async), fields/properties, private `#members`, and abstract methods; object literal methods correctly excluded
