@@ -44,7 +44,7 @@ pub struct ParsedRef {
 const MAX_CONTEXT_LEN: usize = 500;
 
 /// Truncate context to avoid storing huge minified lines
-fn truncate_context(s: &str) -> String {
+pub(crate) fn truncate_context(s: &str) -> String {
     if s.len() <= MAX_CONTEXT_LEN {
         s.to_string()
     } else {
@@ -56,9 +56,9 @@ fn truncate_context(s: &str) -> String {
     }
 }
 
-use std::collections::HashSet;
 use anyhow::Result;
 use regex::Regex;
+use std::collections::HashSet;
 use std::sync::LazyLock;
 
 /// Strip C-style comments (// and /* */) while preserving line numbers.
@@ -180,9 +180,7 @@ pub fn strip_python_docstrings(content: &str) -> String {
     let mut i = 0;
 
     while i < len {
-        if i + 2 < len
-            && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"'
-        {
+        if i + 2 < len && bytes[i] == b'"' && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
             // Triple-quoted string: replace with spaces, preserve newlines
             result.push(b' ');
             result.push(b' ');
@@ -203,8 +201,7 @@ pub fn strip_python_docstrings(content: &str) -> String {
                     i += 1;
                 }
             }
-        } else if i + 2 < len
-            && bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''
+        } else if i + 2 < len && bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\''
         {
             // Triple single-quoted string
             result.push(b' ');
@@ -212,7 +209,11 @@ pub fn strip_python_docstrings(content: &str) -> String {
             result.push(b' ');
             i += 3;
             while i < len {
-                if i + 2 < len && bytes[i] == b'\'' && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                if i + 2 < len
+                    && bytes[i] == b'\''
+                    && bytes[i + 1] == b'\''
+                    && bytes[i + 2] == b'\''
+                {
                     result.push(b' ');
                     result.push(b' ');
                     result.push(b' ');
@@ -269,9 +270,12 @@ pub fn strip_perl_pod(content: &str) -> String {
     let mut in_pod = false;
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("=pod") || trimmed.starts_with("=head")
-            || trimmed.starts_with("=over") || trimmed.starts_with("=item")
-            || trimmed.starts_with("=begin") || trimmed.starts_with("=for")
+        if trimmed.starts_with("=pod")
+            || trimmed.starts_with("=head")
+            || trimmed.starts_with("=over")
+            || trimmed.starts_with("=item")
+            || trimmed.starts_with("=begin")
+            || trimmed.starts_with("=for")
             || trimmed.starts_with("=encoding")
         {
             in_pod = true;
@@ -303,7 +307,12 @@ pub fn strip_xml_comments(content: &str) -> String {
     let mut i = 0;
 
     while i < len {
-        if i + 3 < len && bytes[i] == b'<' && bytes[i + 1] == b'!' && bytes[i + 2] == b'-' && bytes[i + 3] == b'-' {
+        if i + 3 < len
+            && bytes[i] == b'<'
+            && bytes[i + 1] == b'!'
+            && bytes[i + 2] == b'-'
+            && bytes[i + 3] == b'-'
+        {
             // XML comment: replace with spaces, preserve newlines
             result.push(b' ');
             result.push(b' ');
@@ -336,7 +345,7 @@ pub fn strip_xml_comments(content: &str) -> String {
 
 // Re-export parser functions for fallback languages (no tree-sitter support)
 pub use perl::parse_perl_symbols;
-pub use typescript::{parse_typescript_symbols, extract_vue_script, extract_svelte_script};
+pub use typescript::{extract_svelte_script, extract_vue_script, parse_typescript_symbols};
 pub use wsdl::parse_wsdl_symbols;
 
 /// File type for parser dispatch
@@ -430,7 +439,10 @@ pub mod treesitter;
 
 /// Parse symbols and references from file content using FileType enum.
 /// Tries tree-sitter first for supported languages, falls back to regex.
-pub fn parse_file_symbols(content: &str, file_type: FileType) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
+pub fn parse_file_symbols(
+    content: &str,
+    file_type: FileType,
+) -> Result<(Vec<ParsedSymbol>, Vec<ParsedRef>)> {
     // Try tree-sitter parser first
     if let Some(ts_parser) = treesitter::get_treesitter_parser(file_type) {
         let symbols = ts_parser.parse_symbols(content)?;
@@ -463,38 +475,125 @@ pub fn parse_file_symbols(content: &str, file_type: FileType) -> Result<(Vec<Par
 }
 
 /// Extract references/usages from file content
-pub fn extract_references(content: &str, defined_symbols: &[ParsedSymbol]) -> Result<Vec<ParsedRef>> {
+pub fn extract_references(
+    content: &str,
+    defined_symbols: &[ParsedSymbol],
+) -> Result<Vec<ParsedRef>> {
     let mut refs = Vec::new();
 
     // Build set of locally defined symbol names (to skip them)
-    let defined_names: HashSet<&str> = defined_symbols.iter().map(|s| s.name.as_str()).collect();
+    // do not exclude imports -- calls to imported symbols should appear in refs
+    let defined_names: HashSet<&str> = defined_symbols
+        .iter()
+        .filter(|s| s.kind != SymbolKind::Import)
+        .map(|s| s.name.as_str())
+        .collect();
 
     // Regex for identifiers that might be references:
     // - CamelCase identifiers (types, classes) like PaymentRepository, String
     // - Function calls like getCards(, process(
-    static IDENTIFIER_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
+    static IDENTIFIER_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([A-Z][a-zA-Z0-9]*)\b").unwrap());
 
     let identifier_re = &*IDENTIFIER_RE; // CamelCase types
-    static FUNC_CALL_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
+    static FUNC_CALL_RE: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"\b([a-z][a-zA-Z0-9]*)\s*\(").unwrap());
 
     let func_call_re = &*FUNC_CALL_RE; // function calls
 
     // Keywords to skip (static to avoid re-creating on every call)
     static KEYWORDS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
         [
-            "if", "else", "when", "while", "for", "do", "try", "catch", "finally",
-            "return", "break", "continue", "throw", "is", "in", "as", "true", "false",
-            "null", "this", "super", "class", "interface", "object", "fun", "val", "var",
-            "import", "package", "private", "public", "protected", "internal", "override",
-            "abstract", "final", "open", "sealed", "data", "inner", "enum", "companion",
-            "lateinit", "const", "suspend", "inline", "crossinline", "noinline", "reified",
-            "annotation", "typealias", "get", "set", "init", "constructor", "by", "where",
+            "if",
+            "else",
+            "when",
+            "while",
+            "for",
+            "do",
+            "try",
+            "catch",
+            "finally",
+            "return",
+            "break",
+            "continue",
+            "throw",
+            "is",
+            "in",
+            "as",
+            "true",
+            "false",
+            "null",
+            "this",
+            "super",
+            "class",
+            "interface",
+            "object",
+            "fun",
+            "val",
+            "var",
+            "import",
+            "package",
+            "private",
+            "public",
+            "protected",
+            "internal",
+            "override",
+            "abstract",
+            "final",
+            "open",
+            "sealed",
+            "data",
+            "inner",
+            "enum",
+            "companion",
+            "lateinit",
+            "const",
+            "suspend",
+            "inline",
+            "crossinline",
+            "noinline",
+            "reified",
+            "annotation",
+            "typealias",
+            "get",
+            "set",
+            "init",
+            "constructor",
+            "by",
+            "where",
             // Common standard library that would create too much noise
-            "String", "Int", "Long", "Double", "Float", "Boolean", "Byte", "Short", "Char",
-            "Unit", "Any", "Nothing", "List", "Map", "Set", "Array", "Pair", "Triple",
-            "MutableList", "MutableMap", "MutableSet", "HashMap", "ArrayList", "HashSet",
-            "Exception", "Error", "Throwable", "Result", "Sequence",
-        ].into_iter().collect()
+            "String",
+            "Int",
+            "Long",
+            "Double",
+            "Float",
+            "Boolean",
+            "Byte",
+            "Short",
+            "Char",
+            "Unit",
+            "Any",
+            "Nothing",
+            "List",
+            "Map",
+            "Set",
+            "Array",
+            "Pair",
+            "Triple",
+            "MutableList",
+            "MutableMap",
+            "MutableSet",
+            "HashMap",
+            "ArrayList",
+            "HashSet",
+            "Exception",
+            "Error",
+            "Throwable",
+            "Result",
+            "Sequence",
+        ]
+        .into_iter()
+        .collect()
     });
     let keywords = &*KEYWORDS;
 
@@ -620,17 +719,18 @@ mod tests {
     #[test]
     fn test_extract_references_skips_defined_symbols() {
         let content = "class MyClass {\n    val other: OtherClass\n}\n";
-        let symbols = vec![
-            ParsedSymbol {
-                name: "MyClass".to_string(),
-                kind: SymbolKind::Class,
-                line: 1,
-                signature: "class MyClass".to_string(),
-                parents: vec![],
-            },
-        ];
+        let symbols = vec![ParsedSymbol {
+            name: "MyClass".to_string(),
+            kind: SymbolKind::Class,
+            line: 1,
+            signature: "class MyClass".to_string(),
+            parents: vec![],
+        }];
         let refs = extract_references(content, &symbols).unwrap();
-        assert!(!refs.iter().any(|r| r.name == "MyClass"), "should skip locally defined symbols");
+        assert!(
+            !refs.iter().any(|r| r.name == "MyClass"),
+            "should skip locally defined symbols"
+        );
         assert!(refs.iter().any(|r| r.name == "OtherClass"));
     }
 
@@ -693,7 +793,8 @@ mod tests {
 
     #[test]
     fn test_strip_python_docstrings() {
-        let code = "class Foo:\n    \"\"\"This is a docstring\"\"\"\n    def bar(self):\n        pass\n";
+        let code =
+            "class Foo:\n    \"\"\"This is a docstring\"\"\"\n    def bar(self):\n        pass\n";
         let stripped = strip_python_docstrings(code);
         assert!(!stripped.contains("This is a docstring"));
         assert!(stripped.contains("def bar(self):"));
@@ -701,7 +802,8 @@ mod tests {
 
     #[test]
     fn test_strip_xml_comments() {
-        let code = "<types>\n<!-- <type name=\"Commented\"/> -->\n<type name=\"Real\"/>\n</types>\n";
+        let code =
+            "<types>\n<!-- <type name=\"Commented\"/> -->\n<type name=\"Real\"/>\n</types>\n";
         let stripped = strip_xml_comments(code);
         assert!(!stripped.contains("Commented"));
         assert!(stripped.contains("Real"));
@@ -722,8 +824,14 @@ mod tests {
         let code = "class RealClass {}\n// class FakeClass {}\n/* class AnotherFake {} */\n";
         let (symbols, _) = parse_file_symbols(code, FileType::Kotlin).unwrap();
         assert!(symbols.iter().any(|s| s.name == "RealClass"));
-        assert!(!symbols.iter().any(|s| s.name == "FakeClass"), "commented class should not be indexed");
-        assert!(!symbols.iter().any(|s| s.name == "AnotherFake"), "block-commented class should not be indexed");
+        assert!(
+            !symbols.iter().any(|s| s.name == "FakeClass"),
+            "commented class should not be indexed"
+        );
+        assert!(
+            !symbols.iter().any(|s| s.name == "AnotherFake"),
+            "block-commented class should not be indexed"
+        );
     }
 
     #[test]

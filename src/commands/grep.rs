@@ -23,7 +23,7 @@ use anyhow::Result;
 use colored::Colorize;
 use regex::Regex;
 
-use super::{search_files_limited, relative_path};
+use super::{relative_path, search_files_limited};
 
 /// Find TODO/FIXME/HACK comments
 pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
@@ -38,25 +38,33 @@ pub fn cmd_todo(root: &Path, pattern: &str, limit: usize) -> Result<()> {
 
     let mut count = 0;
 
-    search_files_limited(root, &search_pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], limit, |path, line_num, line| {
+    search_files_limited(
+        root,
+        &search_pattern,
+        &["kt", "java", "swift", "m", "h", "pm", "pl", "t"],
+        limit,
+        |path, line_num, line| {
+            let rel_path = relative_path(root, path);
+            let content: String = line.chars().take(80).collect();
+            let upper = content.to_uppercase();
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.chars().take(80).collect();
-        let upper = content.to_uppercase();
+            let category = if upper.contains("TODO") {
+                "TODO"
+            } else if upper.contains("FIXME") {
+                "FIXME"
+            } else if upper.contains("HACK") {
+                "HACK"
+            } else {
+                "OTHER"
+            };
 
-        let category = if upper.contains("TODO") {
-            "TODO"
-        } else if upper.contains("FIXME") {
-            "FIXME"
-        } else if upper.contains("HACK") {
-            "HACK"
-        } else {
-            "OTHER"
-        };
-
-        todos.get_mut(category).unwrap().push((rel_path, line_num, content));
-        count += 1;
-    })?;
+            todos
+                .get_mut(category)
+                .unwrap()
+                .push((rel_path, line_num, content));
+            count += 1;
+        },
+    )?;
 
     let total: usize = todos.values().map(|v| v.len()).sum();
     println!("{}", format!("Found {} comments:", total).bold());
@@ -95,18 +103,34 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()>
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut count = 0;
 
-    search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], limit, |path, line_num, line| {
-        if def_pattern.is_match(line) { return; } // Skip definitions
+    search_files_limited(
+        root,
+        &pattern,
+        &[
+            "kt", "java", "swift", "m", "h", "pm", "pl", "t", "py", "go", "rs", "rb",
+        ],
+        limit,
+        |path, line_num, line| {
+            if def_pattern.is_match(line) {
+                return;
+            } // Skip definitions
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.chars().take(70).collect();
+            let rel_path = relative_path(root, path);
+            let content: String = line.chars().take(70).collect();
 
-        by_file.entry(rel_path).or_default().push((line_num, content));
-        count += 1;
-    })?;
+            by_file
+                .entry(rel_path)
+                .or_default()
+                .push((line_num, content));
+            count += 1;
+        },
+    )?;
 
     let total: usize = by_file.values().map(|v| v.len()).sum();
-    println!("{}", format!("Callers of '{}' ({}):", function_name, total).bold());
+    println!(
+        "{}",
+        format!("Callers of '{}' ({}):", function_name, total).bold()
+    );
 
     for (path, items) in by_file.iter() {
         println!("\n  {}:", path.cyan());
@@ -120,7 +144,12 @@ pub fn cmd_callers(root: &Path, function_name: &str, limit: usize) -> Result<()>
 }
 
 /// Show call hierarchy (callers tree) for a function
-pub fn cmd_call_tree(root: &Path, function_name: &str, max_depth: usize, limit_per_level: usize) -> Result<()> {
+pub fn cmd_call_tree(
+    root: &Path,
+    function_name: &str,
+    max_depth: usize,
+    limit_per_level: usize,
+) -> Result<()> {
     let start = Instant::now();
 
     println!("{}", format!("Call tree for '{}':", function_name).bold());
@@ -129,7 +158,14 @@ pub fn cmd_call_tree(root: &Path, function_name: &str, max_depth: usize, limit_p
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     visited.insert(function_name.to_string());
 
-    build_call_tree(root, function_name, 1, max_depth, limit_per_level, &mut visited)?;
+    build_call_tree(
+        root,
+        function_name,
+        1,
+        max_depth,
+        limit_per_level,
+        &mut visited,
+    )?;
 
     eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     Ok(())
@@ -159,9 +195,22 @@ fn build_call_tree(
         let is_new = visited.insert(caller_func.clone());
 
         if is_new {
-            println!("{}← {} ({}:{})", indent, caller_func.yellow(), file_path, line_num);
+            println!(
+                "{}← {} ({}:{})",
+                indent,
+                caller_func.yellow(),
+                file_path,
+                line_num
+            );
             // Recursively find callers of this function
-            build_call_tree(root, &caller_func, current_depth + 1, max_depth, limit, visited)?;
+            build_call_tree(
+                root,
+                &caller_func,
+                current_depth + 1,
+                max_depth,
+                limit,
+                visited,
+            )?;
         } else {
             println!("{}← {} (recursive)", indent, caller_func.dimmed());
         }
@@ -192,15 +241,28 @@ fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Resu
     let mut files_with_calls: HashMap<PathBuf, Vec<usize>> = HashMap::new();
 
     // First pass: find all files and line numbers with calls
-    search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], limit * 3, |path, line_num, line| {
-        if def_pattern.is_match(line) { return; }
+    search_files_limited(
+        root,
+        &pattern,
+        &["kt", "java", "swift", "m", "h", "pm", "pl", "t"],
+        limit * 3,
+        |path, line_num, line| {
+            if def_pattern.is_match(line) {
+                return;
+            }
 
-        files_with_calls.entry(path.to_path_buf()).or_default().push(line_num);
-    })?;
+            files_with_calls
+                .entry(path.to_path_buf())
+                .or_default()
+                .push(line_num);
+        },
+    )?;
 
     // Second pass: for each call location, find the containing function
     for (file_path, call_lines) in files_with_calls {
-        if results.len() >= limit { break; }
+        if results.len() >= limit {
+            break;
+        }
 
         let content = match std::fs::read_to_string(&file_path) {
             Ok(c) => c,
@@ -211,12 +273,19 @@ fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Resu
         let rel_path = relative_path(root, &file_path);
 
         for call_line in call_lines {
-            if results.len() >= limit { break; }
+            if results.len() >= limit {
+                break;
+            }
 
             // Search backwards to find the containing function
-            if let Some((func_name, func_line)) = find_containing_function(&lines, call_line, &func_def_re) {
+            if let Some((func_name, func_line)) =
+                find_containing_function(&lines, call_line, &func_def_re)
+            {
                 // Avoid adding the same function twice for this target
-                if !results.iter().any(|(f, p, _)| f == &func_name && p == &rel_path) {
+                if !results
+                    .iter()
+                    .any(|(f, p, _)| f == &func_name && p == &rel_path)
+                {
                     results.push((func_name, rel_path.clone(), func_line));
                 }
             }
@@ -227,7 +296,11 @@ fn find_caller_functions(root: &Path, function_name: &str, limit: usize) -> Resu
 }
 
 /// Find the function that contains a given line number
-fn find_containing_function(lines: &[&str], target_line: usize, func_def_re: &Regex) -> Option<(String, usize)> {
+fn find_containing_function(
+    lines: &[&str],
+    target_line: usize,
+    func_def_re: &Regex,
+) -> Option<(String, usize)> {
     // Search backwards from the target line to find a function definition
     let start_idx = (target_line.saturating_sub(1)).min(lines.len().saturating_sub(1));
 
@@ -273,14 +346,19 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
             break;
         }
         let path = entry.path();
-        if !path.extension().map(|e| e == "kt" || e == "java").unwrap_or(false) {
+        if !path
+            .extension()
+            .map(|e| e == "kt" || e == "java")
+            .unwrap_or(false)
+        {
             continue;
         }
 
         if let Ok(content) = std::fs::read_to_string(path) {
             let lines: Vec<&str> = content.lines().collect();
             let kotlin_re = Regex::new(&format!(r":\s*\w*{}\b", regex::escape(type_name))).ok();
-            let java_re = Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name))).ok();
+            let java_re =
+                Regex::new(&format!(r"\b\w*{}\s+\w+\s*\(", regex::escape(type_name))).ok();
             for (i, line) in lines.iter().enumerate() {
                 if results.len() >= limit {
                     break;
@@ -292,8 +370,14 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
                     // Check if return type matches (allow prefix like AppIconInteractor matches Interactor)
                     // Kotlin pattern: `: ReturnType` (colon before type)
                     // Java pattern: `ReturnType methodName(` (type before method name)
-                    let matches_kotlin = kotlin_re.as_ref().map(|re| re.is_match(&context)).unwrap_or(false);
-                    let matches_java = java_re.as_ref().map(|re| re.is_match(&context)).unwrap_or(false);
+                    let matches_kotlin = kotlin_re
+                        .as_ref()
+                        .map(|re| re.is_match(&context))
+                        .unwrap_or(false);
+                    let matches_java = java_re
+                        .as_ref()
+                        .map(|re| re.is_match(&context))
+                        .unwrap_or(false);
                     if matches_kotlin || matches_java {
                         let rel_path = relative_path(root, path);
                         // Get the function line (usually next line after annotation)
@@ -318,7 +402,10 @@ pub fn cmd_provides(root: &Path, type_name: &str, limit: usize) -> Result<()> {
         }
     }
 
-    println!("{}", format!("Providers for '{}' ({}):", type_name, results.len()).bold());
+    println!(
+        "{}",
+        format!("Providers for '{}' ({}):", type_name, results.len()).bold()
+    );
 
     for (path, line_num, content) in &results {
         println!("  {}:{}", path, line_num);
@@ -339,7 +426,6 @@ pub fn cmd_suspend(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
     let mut suspends: Vec<(String, String, usize)> = vec![];
 
     search_files_limited(root, pattern, &["kt"], limit, |path, line_num, line| {
-
         if let Some(caps) = func_regex.captures(line) {
             let func_name = caps.get(1).unwrap().as_str().to_string();
 
@@ -354,7 +440,10 @@ pub fn cmd_suspend(root: &Path, query: Option<&str>, limit: usize) -> Result<()>
         }
     })?;
 
-    println!("{}", format!("Suspend functions ({}):", suspends.len()).bold());
+    println!(
+        "{}",
+        format!("Suspend functions ({}):", suspends.len()).bold()
+    );
 
     for (func_name, path, line_num) in &suspends {
         println!("  {}: {}:{}", func_name.cyan(), path, line_num);
@@ -419,7 +508,10 @@ pub fn cmd_composables(root: &Path, query: Option<&str>, limit: usize) -> Result
 
     composables.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
 
-    println!("{}", format!("@Composable functions ({}):", composables.len()).bold());
+    println!(
+        "{}",
+        format!("@Composable functions ({}):", composables.len()).bold()
+    );
 
     for (func_name, path, line_num) in &composables {
         println!("  {}: {}:{}", func_name.cyan(), path, line_num);
@@ -438,17 +530,23 @@ pub fn cmd_deprecated(root: &Path, query: Option<&str>, limit: usize) -> Result<
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files_limited(root, pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], limit, |path, line_num, line| {
-        if let Some(q) = query {
-            if !line.to_lowercase().contains(&q.to_lowercase()) {
-                return;
+    search_files_limited(
+        root,
+        pattern,
+        &["kt", "java", "swift", "m", "h", "pm", "pl", "t"],
+        limit,
+        |path, line_num, line| {
+            if let Some(q) = query {
+                if !line.to_lowercase().contains(&q.to_lowercase()) {
+                    return;
+                }
             }
-        }
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(80).collect();
-        items.push((rel_path, line_num, content));
-    })?;
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(80).collect();
+            items.push((rel_path, line_num, content));
+        },
+    )?;
 
     println!("{}", format!("@Deprecated items ({}):", items.len()).bold());
 
@@ -480,7 +578,10 @@ pub fn cmd_suppress(root: &Path, query: Option<&str>, limit: usize) -> Result<()
         items.push((rel_path, line_num, content));
     })?;
 
-    println!("{}", format!("@Suppress annotations ({}):", items.len()).bold());
+    println!(
+        "{}",
+        format!("@Suppress annotations ({}):", items.len()).bold()
+    );
 
     for (path, line_num, content) in &items {
         println!("  {}:{}", path.cyan(), line_num);
@@ -504,13 +605,15 @@ pub fn cmd_inject(root: &Path, type_name: &str, limit: usize) -> Result<()> {
             return;
         }
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(80).collect();
-        items.push((rel_path, line_num, content));
-    })?;
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(80).collect();
+            items.push((rel_path, line_num, content));
+        },
+    )?;
 
     // Filter to those containing type_name
-    let filtered: Vec<_> = items.iter()
+    let filtered: Vec<_> = items
+        .iter()
         .filter(|(_, _, line)| line.contains(type_name))
         .take(limit)
         .collect();
@@ -540,13 +643,22 @@ pub fn cmd_annotations(root: &Path, annotation: &str, limit: usize) -> Result<()
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files_limited(root, &pattern, &["kt", "java", "swift", "m", "h", "pm", "pl", "t"], limit, |path, line_num, line| {
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(80).collect();
-        items.push((rel_path, line_num, content));
-    })?;
+    search_files_limited(
+        root,
+        &pattern,
+        &["kt", "java", "swift", "m", "h", "pm", "pl", "t"],
+        limit,
+        |path, line_num, line| {
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(80).collect();
+            items.push((rel_path, line_num, content));
+        },
+    )?;
 
-    println!("{}", format!("Classes with {} ({}):", search_annotation, items.len()).bold());
+    println!(
+        "{}",
+        format!("Classes with {} ({}):", search_annotation, items.len()).bold()
+    );
 
     for (path, line_num, content) in &items {
         println!("  {}:{}", path.cyan(), line_num);
@@ -567,17 +679,23 @@ pub fn cmd_deeplinks(root: &Path, query: Option<&str>, limit: usize) -> Result<(
 
     let mut items: Vec<(String, usize, String)> = vec![];
 
-    search_files_limited(root, pattern, &["kt", "java", "xml", "swift", "m", "h", "plist"], limit, |path, line_num, line| {
-        if let Some(q) = query {
-            if !line.to_lowercase().contains(&q.to_lowercase()) {
-                return;
+    search_files_limited(
+        root,
+        pattern,
+        &["kt", "java", "xml", "swift", "m", "h", "plist"],
+        limit,
+        |path, line_num, line| {
+            if let Some(q) = query {
+                if !line.to_lowercase().contains(&q.to_lowercase()) {
+                    return;
+                }
             }
-        }
 
-        let rel_path = relative_path(root, path);
-        let content: String = line.trim().chars().take(100).collect();
-        items.push((rel_path, line_num, content));
-    })?;
+            let rel_path = relative_path(root, path);
+            let content: String = line.trim().chars().take(100).collect();
+            items.push((rel_path, line_num, content));
+        },
+    )?;
 
     println!("{}", format!("Deeplinks ({}):", items.len()).bold());
 
@@ -604,19 +722,28 @@ pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<
 
     let mut items: Vec<(String, String, usize, String)> = vec![]; // (name, path, line, lang)
 
-    search_files_limited(root, &pattern, &["kt", "swift"], limit, |path, line_num, line| {
-        let rel_path = relative_path(root, path);
+    search_files_limited(
+        root,
+        &pattern,
+        &["kt", "swift"],
+        limit,
+        |path, line_num, line| {
+            let rel_path = relative_path(root, path);
 
-        if let Some(caps) = kotlin_regex.captures(line) {
-            let func_name = caps.get(1).unwrap().as_str().to_string();
-            items.push((func_name, rel_path, line_num, "kt".to_string()));
-        } else if swift_regex.is_match(line) {
-            let content: String = line.trim().chars().take(60).collect();
-            items.push((content, rel_path, line_num, "swift".to_string()));
-        }
-    })?;
+            if let Some(caps) = kotlin_regex.captures(line) {
+                let func_name = caps.get(1).unwrap().as_str().to_string();
+                items.push((func_name, rel_path, line_num, "kt".to_string()));
+            } else if swift_regex.is_match(line) {
+                let content: String = line.trim().chars().take(60).collect();
+                items.push((content, rel_path, line_num, "swift".to_string()));
+            }
+        },
+    )?;
 
-    println!("{}", format!("Extensions for {} ({}):", receiver_type, items.len()).bold());
+    println!(
+        "{}",
+        format!("Extensions for {} ({}):", receiver_type, items.len()).bold()
+    );
 
     for (name, path, line_num, lang) in &items {
         if lang == "kt" {
@@ -634,7 +761,8 @@ pub fn cmd_extensions(root: &Path, receiver_type: &str, limit: usize) -> Result<
 pub fn cmd_flows(root: &Path, query: Option<&str>, limit: usize) -> Result<()> {
     let start = Instant::now();
     let pattern = r"(StateFlow|SharedFlow|MutableStateFlow|MutableSharedFlow|Flow<)";
-    let flow_regex = Regex::new(r"(StateFlow|SharedFlow|MutableStateFlow|MutableSharedFlow|Flow)<")?;
+    let flow_regex =
+        Regex::new(r"(StateFlow|SharedFlow|MutableStateFlow|MutableSharedFlow|Flow)<")?;
 
     let mut items: Vec<(String, String, usize, String)> = vec![];
 
@@ -720,7 +848,10 @@ pub fn cmd_previews(root: &Path, query: Option<&str>, limit: usize) -> Result<()
 
     items.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
 
-    println!("{}", format!("@Preview functions ({}):", items.len()).bold());
+    println!(
+        "{}",
+        format!("@Preview functions ({}):", items.len()).bold()
+    );
 
     for (func_name, path, line_num) in &items {
         println!("  {}: {}:{}", func_name.cyan(), path, line_num);
