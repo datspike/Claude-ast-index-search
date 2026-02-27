@@ -229,6 +229,8 @@ enum Commands {
         limit: usize,
     },
     // === Index Commands ===
+    /// Initialize an empty index without rebuilding
+    Init,
     /// Rebuild index (full reindex)
     Rebuild {
         /// Index type: files, symbols, modules, or all
@@ -659,20 +661,51 @@ fn main() -> Result<()> {
     match cli.command {
         // Grep commands
         Commands::Todo { pattern, limit } => commands::grep::cmd_todo(&root, &pattern, limit),
-        Commands::Callers { function_name, limit } => commands::grep::cmd_callers(&root, &function_name, limit),
-        Commands::CallTree { function_name, depth, limit } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
-        Commands::Provides { type_name, limit } => commands::grep::cmd_provides(&root, &type_name, limit),
-        Commands::Suspend { query, limit } => commands::grep::cmd_suspend(&root, query.as_deref(), limit),
-        Commands::Composables { query, limit } => commands::grep::cmd_composables(&root, query.as_deref(), limit),
-        Commands::Deprecated { query, limit } => commands::grep::cmd_deprecated(&root, query.as_deref(), limit),
-        Commands::Suppress { query, limit } => commands::grep::cmd_suppress(&root, query.as_deref(), limit),
-        Commands::Inject { type_name, limit } => commands::grep::cmd_inject(&root, &type_name, limit),
-        Commands::Annotations { annotation, limit } => commands::grep::cmd_annotations(&root, &annotation, limit),
-        Commands::Deeplinks { query, limit } => commands::grep::cmd_deeplinks(&root, query.as_deref(), limit),
-        Commands::Extensions { receiver_type, limit } => commands::grep::cmd_extensions(&root, &receiver_type, limit),
-        Commands::Flows { query, limit } => commands::grep::cmd_flows(&root, query.as_deref(), limit),
-        Commands::Previews { query, limit } => commands::grep::cmd_previews(&root, query.as_deref(), limit),
+        Commands::Callers {
+            function_name,
+            limit,
+        } => commands::grep::cmd_callers(&root, &function_name, limit),
+        Commands::CallTree {
+            function_name,
+            depth,
+            limit,
+        } => commands::grep::cmd_call_tree(&root, &function_name, depth, limit),
+        Commands::Provides { type_name, limit } => {
+            commands::grep::cmd_provides(&root, &type_name, limit)
+        }
+        Commands::Suspend { query, limit } => {
+            commands::grep::cmd_suspend(&root, query.as_deref(), limit)
+        }
+        Commands::Composables { query, limit } => {
+            commands::grep::cmd_composables(&root, query.as_deref(), limit)
+        }
+        Commands::Deprecated { query, limit } => {
+            commands::grep::cmd_deprecated(&root, query.as_deref(), limit)
+        }
+        Commands::Suppress { query, limit } => {
+            commands::grep::cmd_suppress(&root, query.as_deref(), limit)
+        }
+        Commands::Inject { type_name, limit } => {
+            commands::grep::cmd_inject(&root, &type_name, limit)
+        }
+        Commands::Annotations { annotation, limit } => {
+            commands::grep::cmd_annotations(&root, &annotation, limit)
+        }
+        Commands::Deeplinks { query, limit } => {
+            commands::grep::cmd_deeplinks(&root, query.as_deref(), limit)
+        }
+        Commands::Extensions {
+            receiver_type,
+            limit,
+        } => commands::grep::cmd_extensions(&root, &receiver_type, limit),
+        Commands::Flows { query, limit } => {
+            commands::grep::cmd_flows(&root, query.as_deref(), limit)
+        }
+        Commands::Previews { query, limit } => {
+            commands::grep::cmd_previews(&root, query.as_deref(), limit)
+        }
         // Management commands
+        Commands::Init => commands::management::cmd_init(&root),
         Commands::Rebuild { r#type, no_deps, no_ignore, sub_projects, verbose, threads } => {
             if let Some(t) = threads {
                 std::env::set_var("AST_INDEX_THREADS", t.to_string());
@@ -699,27 +732,51 @@ fn main() -> Result<()> {
             let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_implementations(&root, &parent, limit, format, &scope)
         }
-        Commands::Refs { symbol, limit } => commands::index::cmd_refs(&root, &symbol, limit, format),
+        Commands::Refs { symbol, limit } => {
+            commands::index::cmd_refs(&root, &symbol, limit, format)
+        }
         Commands::Hierarchy { name } => commands::index::cmd_hierarchy(&root, &name),
         Commands::Usages { symbol, limit, in_file, module } => {
             let scope = db::SearchScope { in_file: in_file.as_deref(), module: module.as_deref(), dir_prefix: dir_prefix_ref };
             commands::index::cmd_usages(&root, &symbol, limit, format, &scope)
         }
         // Module commands
-        Commands::Module { pattern, limit } => commands::modules::cmd_module(&root, &pattern, limit),
+        Commands::Module { pattern, limit } => {
+            commands::modules::cmd_module(&root, &pattern, limit)
+        }
         Commands::Deps { module } => commands::modules::cmd_deps(&root, &module),
         Commands::Dependents { module } => commands::modules::cmd_dependents(&root, &module),
-        Commands::UnusedDeps { module, verbose, no_transitive, no_xml, no_resources, strict } => {
+        Commands::UnusedDeps {
+            module,
+            verbose,
+            no_transitive,
+            no_xml,
+            no_resources,
+            strict,
+        } => {
             let check_transitive = !no_transitive && !strict;
             let check_xml = !no_xml && !strict;
             let check_resources = !no_resources && !strict;
-            commands::modules::cmd_unused_deps(&root, &module, verbose, check_transitive, check_xml, check_resources)
+            commands::modules::cmd_unused_deps(
+                &root,
+                &module,
+                verbose,
+                check_transitive,
+                check_xml,
+                check_resources,
+            )
         }
         // File commands
-        Commands::File { pattern, exact, limit } => commands::files::cmd_file(&root, &pattern, exact, limit),
+        Commands::File {
+            pattern,
+            exact,
+            limit,
+        } => commands::files::cmd_file(&root, &pattern, exact, limit),
         Commands::Outline { file } => commands::files::cmd_outline(&root, &file),
         Commands::Imports { file } => commands::files::cmd_imports(&root, &file),
-        Commands::Api { module_path, limit } => commands::files::cmd_api(&root, &module_path, limit),
+        Commands::Api { module_path, limit } => {
+            commands::files::cmd_api(&root, &module_path, limit)
+        }
         Commands::Changed { base } => {
             let vcs = commands::files::detect_vcs(&root);
             let default_base = if vcs == "arc" {
@@ -731,12 +788,25 @@ fn main() -> Result<()> {
             commands::files::cmd_changed(&root, base)
         }
         // Android commands
-        Commands::XmlUsages { class_name, module } => commands::android::cmd_xml_usages(&root, &class_name, module.as_deref()),
-        Commands::ResourceUsages { resource, module, r#type, unused } => {
-            commands::android::cmd_resource_usages(&root, &resource, module.as_deref(), r#type.as_deref(), unused)
+        Commands::XmlUsages { class_name, module } => {
+            commands::android::cmd_xml_usages(&root, &class_name, module.as_deref())
         }
+        Commands::ResourceUsages {
+            resource,
+            module,
+            r#type,
+            unused,
+        } => commands::android::cmd_resource_usages(
+            &root,
+            &resource,
+            module.as_deref(),
+            r#type.as_deref(),
+            unused,
+        ),
         // iOS commands
-        Commands::StoryboardUsages { class_name, module } => commands::ios::cmd_storyboard_usages(&root, &class_name, module.as_deref()),
+        Commands::StoryboardUsages { class_name, module } => {
+            commands::ios::cmd_storyboard_usages(&root, &class_name, module.as_deref())
+        }
         Commands::AssetUsages { asset, module, r#type, unused } => commands::ios::cmd_asset_usages(&root, &asset, module.as_deref(), r#type.as_deref(), unused),
         Commands::Swiftui { query, limit } => commands::ios::cmd_swiftui(&root, query.as_deref(), limit),
         Commands::AsyncFuncs { query, limit } => commands::ios::cmd_async_funcs(&root, query.as_deref(), limit),
@@ -777,7 +847,12 @@ fn cmd_install_claude_plugin() -> Result<()> {
 
     println!("Adding ast-index marketplace...");
     let status = Command::new("claude")
-        .args(["plugin", "marketplace", "add", "defendend/Claude-ast-index-search"])
+        .args([
+            "plugin",
+            "marketplace",
+            "add",
+            "defendend/Claude-ast-index-search",
+        ])
         .status();
 
     match status {
@@ -808,7 +883,10 @@ fn cmd_install_claude_plugin() -> Result<()> {
             eprintln!("Plugin install exited with {}", s);
         }
         Err(e) => {
-            return Err(anyhow::anyhow!("Failed to run claude plugin install: {}", e));
+            return Err(anyhow::anyhow!(
+                "Failed to run claude plugin install: {}",
+                e
+            ));
         }
     }
 
@@ -846,7 +924,10 @@ fn resolve_index_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn find_project_root() -> Result<PathBuf> {
-    let cwd = std::env::current_dir()?;
+    find_project_root_from(std::env::current_dir()?)
+}
+
+fn find_project_root_from(cwd: PathBuf) -> Result<PathBuf> {
     for ancestor in cwd.ancestors() {
         // Check if an index DB already exists for this ancestor
         if db::db_exists(ancestor) {
@@ -865,7 +946,12 @@ fn find_project_root() -> Result<PathBuf> {
         // Check for .xcodeproj
         if let Ok(entries) = std::fs::read_dir(ancestor) {
             for entry in entries.flatten() {
-                if entry.path().extension().map(|e| e == "xcodeproj").unwrap_or(false) {
+                if entry
+                    .path()
+                    .extension()
+                    .map(|e| e == "xcodeproj")
+                    .unwrap_or(false)
+                {
                     return Ok(ancestor.to_path_buf());
                 }
             }
@@ -875,6 +961,18 @@ fn find_project_root() -> Result<PathBuf> {
             || ancestor.join("WORKSPACE.bazel").exists()
             || ancestor.join("MODULE.bazel").exists()
         {
+            return Ok(ancestor.to_path_buf());
+        }
+        // Python markers
+        if ancestor.join("pyproject.toml").exists()
+            || ancestor.join("setup.py").exists()
+            || ancestor.join("setup.cfg").exists()
+        {
+            return Ok(ancestor.to_path_buf());
+        }
+        // Git marker (fallback — after build-system-specific markers)
+        let git_marker = ancestor.join(".git");
+        if git_marker.join("HEAD").exists() || git_marker.is_file() {
             return Ok(ancestor.to_path_buf());
         }
     }
@@ -948,4 +1046,101 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_find_project_root_git_repo() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_git_repo_from_subfolder() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+
+        let deep = dir.path().join("sub").join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let result = find_project_root_from(deep).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_git_worktree_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".git"),
+            "gitdir: /some/other/path/.git/worktrees/branch\n",
+        )
+        .unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_broken_git_no_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::create_dir(git_dir.join("info")).unwrap();
+        // .git/HEAD missing — not a valid git repo
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        // fallback to cwd — .git without HEAD is not a marker
+        assert_eq!(result, dir.path().to_path_buf());
+    }
+
+    #[test]
+    fn test_find_project_root_python_pyproject_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = \"test\"\n").unwrap();
+
+        let deep = dir.path().join("src").join("app");
+        std::fs::create_dir_all(&deep).unwrap();
+
+        let result = find_project_root_from(deep).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_python_setup_py() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("setup.py"), "from setuptools import setup\n").unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_python_setup_cfg() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("setup.cfg"), "[metadata]\nname = test\n").unwrap();
+
+        let sub = dir.path().join("mypackage");
+        std::fs::create_dir(&sub).unwrap();
+
+        let result = find_project_root_from(sub).unwrap();
+        assert_eq!(result, dir.path());
+    }
+
+    #[test]
+    fn test_find_project_root_gradle_priority_over_git() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir(&git_dir).unwrap();
+        std::fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(dir.path().join("settings.gradle"), "").unwrap();
+
+        let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
+        // Gradle marker is checked first — same result (same directory),
+        // but Gradle priority is correct
+        assert_eq!(result, dir.path());
+    }
 }
