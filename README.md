@@ -160,6 +160,14 @@ ast-index perl-tests [QUERY]         # Find Test::More assertions (ok, is, like,
 ast-index perl-imports [QUERY]       # Find use/require statements
 ```
 
+### Python (Django/DRF) commands
+
+```bash
+ast-index py.routes                  # List Django/DRF endpoints
+ast-index py.endpoint-trace <PATH>   # Trace endpoint -> handler -> serializer -> model -> settings
+ast-index py.setting-usage <KEY>     # Find settings/env variable usages
+```
+
 ### Index management
 
 ```bash
@@ -269,13 +277,23 @@ ast-index outline "main.dart"      # Show file structure
 ast-index imports "app.dart"       # Show imports
 ```
 
-### Python
+### Python (Django/DRF)
 
 ```bash
 ast-index class "ClassName"        # Find Python classes
-ast-index symbol "function"        # Find functions
+ast-index symbol "_get_jwt"        # Find functions (including private)
 ast-index outline "file.py"        # Show file structure
 ast-index imports "file.py"        # Show imports
+ast-index callers "handle_request" # Find callers (supports .py files)
+ast-index usages "UserService"     # Find usages (self._method(), obj.method())
+```
+
+Django/DRF framework commands (requires `rebuild`):
+
+```bash
+ast-index py.routes                          # List Django/DRF endpoints
+ast-index py.endpoint-trace "/api/users/"    # Trace endpoint -> handler -> serializer -> model -> settings
+ast-index py.setting-usage "DATABASE_URL"    # Find settings/env variable usages
 ```
 
 ### Go
@@ -314,7 +332,7 @@ Benchmarks on large Android project (~29k files, ~300k symbols):
 - **grep-searcher** — ripgrep internals for fast searching
 - **SQLite + FTS5** — full-text search index
 - **rayon** — parallel file parsing
-- **Project root detection** — `settings.gradle(.kts)` > `Package.swift` > `.xcodeproj` > `WORKSPACE`/`MODULE.bazel` > `.git`
+- **Project root detection** — `settings.gradle(.kts)` > `Package.swift` > `.xcodeproj` > `WORKSPACE`/`MODULE.bazel` > `pyproject.toml`/`setup.py`/`setup.cfg` > `.git`
 - **ignore** — gitignore-aware directory traversal
 
 ### Database Schema
@@ -334,6 +352,11 @@ transitive_deps (id, module_id, dependency_id, depth, path)
 storyboard_usages (id, module_id, file_path, line, class_name, usage_type, storyboard_id)
 ios_assets (id, module_id, type, name, file_path)
 ios_asset_usages (id, asset_id, usage_file, usage_line, usage_type)
+-- Python framework graph (Django/DRF)
+py_endpoints (id, method, path_pattern, file_id, line, handler_qname)
+py_endpoint_handlers (id, endpoint_id, symbol_id, confidence, reason)
+py_serializer_models (id, serializer_symbol_id, model_symbol_id, confidence, reason)
+py_symbol_settings (id, symbol_id, key, key_kind, confidence, reason)
 ```
 
 ## Changelog
