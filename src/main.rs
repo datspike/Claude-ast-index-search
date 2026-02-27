@@ -78,6 +78,11 @@ Perl:
   perl-tests             Find test assertions
   perl-imports           Find use/require statements
 
+Python (Django/DRF):
+  py.routes              List Python endpoints (routes)
+  py.endpoint-trace      Trace endpoint -> handler -> serializer -> model -> settings
+  py.setting-usage       Find settings/env key usages
+
 Project Insights:
   map                    Show compact project map (key types per directory)
   conventions            Detect project conventions (architecture, frameworks, naming)
@@ -549,6 +554,32 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    // === Python Commands ===
+    /// List Python endpoints (Django/DRF routes)
+    #[command(name = "py.routes")]
+    PyRoutes {
+        /// Max results
+        #[arg(short, long, default_value = "100")]
+        limit: usize,
+    },
+    /// Trace endpoint -> handler -> serializer -> model -> settings
+    #[command(name = "py.endpoint-trace")]
+    PyEndpointTrace {
+        /// Path pattern to search (substring match)
+        path_pattern: String,
+        /// HTTP method filter (GET, POST, PUT, DELETE)
+        #[arg(long)]
+        method: Option<String>,
+    },
+    /// Find settings/env key usages
+    #[command(name = "py.setting-usage")]
+    PySettingUsage {
+        /// Settings key to search (substring match)
+        key: String,
+        /// Max results
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
     // === Project Insights ===
     /// Show compact project map (key types per directory)
     Map {
@@ -818,6 +849,14 @@ fn main() -> Result<()> {
         Commands::PerlPod { query, limit } => commands::perl::cmd_perl_pod(&root, query.as_deref(), limit),
         Commands::PerlTests { query, limit } => commands::perl::cmd_perl_tests(&root, query.as_deref(), limit),
         Commands::PerlImports { query, limit } => commands::perl::cmd_perl_imports(&root, query.as_deref(), limit),
+        // Python commands
+        Commands::PyRoutes { limit } => commands::python::cmd_py_routes(&root, limit, format),
+        Commands::PyEndpointTrace { path_pattern, method } => {
+            commands::python::cmd_py_endpoint_trace(&root, method.as_deref(), &path_pattern, format)
+        }
+        Commands::PySettingUsage { key, limit } => {
+            commands::python::cmd_py_setting_usage(&root, &key, limit, format)
+        }
         // Project insights
         Commands::Map { module, per_dir, limit } => commands::project_info::cmd_map(&root, module.as_deref(), per_dir, limit, format),
         Commands::Conventions => commands::project_info::cmd_conventions(&root, format),
@@ -1100,7 +1139,11 @@ mod tests {
     #[test]
     fn test_find_project_root_python_pyproject_toml() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("pyproject.toml"), "[project]\nname = \"test\"\n").unwrap();
+        std::fs::write(
+            dir.path().join("pyproject.toml"),
+            "[project]\nname = \"test\"\n",
+        )
+        .unwrap();
 
         let deep = dir.path().join("src").join("app");
         std::fs::create_dir_all(&deep).unwrap();
@@ -1112,7 +1155,11 @@ mod tests {
     #[test]
     fn test_find_project_root_python_setup_py() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("setup.py"), "from setuptools import setup\n").unwrap();
+        std::fs::write(
+            dir.path().join("setup.py"),
+            "from setuptools import setup\n",
+        )
+        .unwrap();
 
         let result = find_project_root_from(dir.path().to_path_buf()).unwrap();
         assert_eq!(result, dir.path());
