@@ -63,7 +63,7 @@ fn resolve_returns_absolute_path_in_extra_root() {
 }
 
 #[test]
-fn strict_resolver_migrates_legacy_direct_connection() {
+fn legacy_direct_connection_migrates_before_strict_resolver() {
     let primary = TempDir::new().unwrap();
     let extra = TempDir::new().unwrap();
     let conn = Connection::open_in_memory().unwrap();
@@ -79,6 +79,13 @@ fn strict_resolver_migrates_legacy_direct_connection() {
     let rel = "src/Legacy.kt";
     fs::create_dir_all(extra.path().join("src")).unwrap();
     fs::write(extra.path().join(rel), "class Legacy").unwrap();
+
+    // Direct connections must explicitly use the legacy migration shim.
+    // PathResolver is also used by read commands and must remain DDL-free.
+    assert_eq!(
+        db::get_extra_roots(&conn).unwrap(),
+        vec![db::normalize_root_for_storage(extra.path())]
+    );
 
     let resolver = PathResolver::try_from_conn(primary.path(), &conn).unwrap();
     assert_eq!(

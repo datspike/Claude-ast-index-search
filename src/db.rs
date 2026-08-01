@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Context, Result};
+use rusqlite::backup::Backup;
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -1846,6 +1847,23 @@ fn resolve_db_path_and_lease(project_root: &Path) -> Result<(PathBuf, ProjectLea
     Ok((db_path, lease, normalized))
 }
 
+/// Check for a normal cache generation without opening it or consulting its
+/// publication marker. Write-root discovery uses this so an interrupted
+/// generation can still be selected and recovered before lifecycle guards.
+pub fn db_exists_for_write_discovery(project_root: &Path) -> bool {
+    if let Some(path) = overridden_db_path() {
+        return path.is_file();
+    }
+    let Some(cache_dir) = cache_base_dir() else {
+        return false;
+    };
+    let normalized = normalize_root_for_storage(project_root);
+    cache_dir
+        .join(simple_hash(&normalized))
+        .join("index.db")
+        .is_file()
+}
+
 /// Get the database path for the current project
 pub fn get_db_path(project_root: &Path) -> Result<PathBuf> {
     resolve_db_path_and_lease(project_root).map(|(path, _lease, _normalized)| path)
@@ -2656,7 +2674,7 @@ fn publication_artifact_bitmap(db_path: &Path) -> Result<[bool; 4]> {
 }
 
 fn valid_publication_staging_dir_name(name: &str) -> bool {
-    (name.starts_with(".rebuild-") || name.starts_with(".restore-"))
+    (name.starts_with(".rebuild-") || name.starts_with(".restore-") || name.starts_with(".update-"))
         && name.len() <= 255
         && name
             .bytes()
@@ -2664,7 +2682,7 @@ fn valid_publication_staging_dir_name(name: &str) -> bool {
 }
 
 fn abandoned_staging_purpose(name: &str) -> Option<&'static str> {
-    for purpose in ["rebuild", "restore"] {
+    for purpose in ["rebuild", "restore", "update"] {
         let Some(remainder) = name.strip_prefix(&format!(".{purpose}-")) else {
             continue;
         };
@@ -2686,7 +2704,7 @@ fn staging_owner_path(directory: &Path) -> PathBuf {
 
 fn validate_staging_location(staged_db: &Path, live_db: &Path, purpose: &str) -> Result<String> {
     anyhow::ensure!(
-        matches!(purpose, "rebuild" | "restore"),
+        matches!(purpose, "rebuild" | "restore" | "update"),
         "unsupported index staging purpose: {purpose}"
     );
     anyhow::ensure!(
@@ -3823,6 +3841,64 @@ fn create_base_schema(conn: &Connection) -> Result<()> {
         );
         "#,
     )?;
+    ensure_django_graph_schema(conn)?;
+    Ok(())
+}
+
+/// Additive Django/DRF graph schema. This is deliberately separate from the
+/// core schema so legacy index databases can be upgraded transactionally.
+fn ensure_django_graph_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS django_endpoints (
+            id INTEGER PRIMARY KEY, method TEXT, path_pattern TEXT NOT NULL,
+            file_id INTEGER NOT NULL, line INTEGER NOT NULL, handler_qname TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
+        );
+        CREATE TABLE IF NOT EXISTS django_endpoint_handlers (
+            id INTEGER PRIMARY KEY, endpoint_id INTEGER NOT NULL, symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'medium', reason TEXT,
+            FOREIGN KEY(endpoint_id) REFERENCES django_endpoints(id) ON DELETE CASCADE,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            UNIQUE(endpoint_id, symbol_id)
+        );
+        CREATE TABLE IF NOT EXISTS django_serializer_models (
+            id INTEGER PRIMARY KEY, serializer_symbol_id INTEGER NOT NULL, model_symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'medium', reason TEXT,
+            FOREIGN KEY(serializer_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(model_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            UNIQUE(serializer_symbol_id, model_symbol_id)
+        );
+        CREATE TABLE IF NOT EXISTS django_symbol_settings (
+            id INTEGER PRIMARY KEY, symbol_id INTEGER NOT NULL, key TEXT NOT NULL,
+            key_kind TEXT NOT NULL DEFAULT 'settings', line INTEGER NOT NULL DEFAULT 0,
+            confidence TEXT NOT NULL DEFAULT 'medium', reason TEXT,
+            FOREIGN KEY(symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            UNIQUE(symbol_id, key, key_kind, line)
+        );
+        CREATE TABLE IF NOT EXISTS django_file_settings (
+            id INTEGER PRIMARY KEY, file_id INTEGER NOT NULL, key TEXT NOT NULL,
+            key_kind TEXT NOT NULL DEFAULT 'settings', line INTEGER NOT NULL DEFAULT 0,
+            confidence TEXT NOT NULL DEFAULT 'medium', reason TEXT,
+            FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE,
+            UNIQUE(file_id, key, key_kind, line)
+        );
+        CREATE TABLE IF NOT EXISTS django_handler_serializers (
+            id INTEGER PRIMARY KEY, handler_symbol_id INTEGER NOT NULL, serializer_symbol_id INTEGER NOT NULL,
+            confidence TEXT NOT NULL DEFAULT 'medium', reason TEXT,
+            FOREIGN KEY(handler_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            FOREIGN KEY(serializer_symbol_id) REFERENCES symbols(id) ON DELETE CASCADE,
+            UNIQUE(handler_symbol_id, serializer_symbol_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_django_endpoints_file ON django_endpoints(file_id);
+        CREATE INDEX IF NOT EXISTS idx_django_endpoints_path ON django_endpoints(path_pattern);
+        CREATE INDEX IF NOT EXISTS idx_django_endpoint_handlers_symbol ON django_endpoint_handlers(symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_django_serializer_models_model ON django_serializer_models(model_symbol_id);
+        CREATE INDEX IF NOT EXISTS idx_django_symbol_settings_key ON django_symbol_settings(key);
+        CREATE INDEX IF NOT EXISTS idx_django_file_settings_key ON django_file_settings(key);
+        CREATE INDEX IF NOT EXISTS idx_django_handler_serializers_serializer ON django_handler_serializers(serializer_symbol_id);
+        "#,
+    )?;
     Ok(())
 }
 
@@ -4105,6 +4181,19 @@ fn inspect_open_migrations(
     let subtrees_exists = table_exists(conn, "subtrees")?;
     let files_exists = table_exists(conn, "files")?;
     let symbols_exists = table_exists(conn, "symbols")?;
+    let django_schema_current = [
+        "django_endpoints",
+        "django_endpoint_handlers",
+        "django_serializer_models",
+        "django_symbol_settings",
+        "django_file_settings",
+        "django_handler_serializers",
+    ]
+    .into_iter()
+    .map(|table| table_exists(conn, table))
+    .collect::<Result<Vec<_>>>()?
+    .into_iter()
+    .all(|exists| exists);
     let files_current = !files_exists || column_exists(conn, "files", "root_path")?;
     let files_uniqueness_current = !files_exists || !files_has_legacy_path_unique(conn)?;
     let symbols_current = !symbols_exists || column_exists(conn, "symbols", "qualified_name")?;
@@ -4151,6 +4240,7 @@ fn inspect_open_migrations(
             || !files_current
             || !files_uniqueness_current
             || !symbols_current
+            || !django_schema_current
             || stored_root.as_deref() != Some(normalized_root)
             || has_legacy_extra_roots,
         optional_indexes,
@@ -4220,6 +4310,7 @@ fn apply_open_migrations_transaction(
         .context("failed to create metadata table")?;
     tx.execute(CREATE_SUBTREES_SQL, [])
         .context("failed to create subtrees table")?;
+    ensure_django_graph_schema(&tx).context("failed to create Django graph schema")?;
 
     if table_exists(&tx, "files")? && !column_exists(&tx, "files", "root_path")? {
         tx.execute(
@@ -4364,6 +4455,34 @@ pub fn open_staged_db(project_root: &Path, staged_db: &Path) -> Result<Connectio
     open_configured_connection(&normalized_root, staged_db)
 }
 
+/// Create a consistent SQLite snapshot in a registered private staging path.
+/// This uses SQLite's backup API; copying the main file/WAL/marker artifacts
+/// would permit a mixed generation to escape the publication lifecycle.
+pub fn backup_live_db_to_staging(project_root: &Path, staged_db: &Path) -> Result<Connection> {
+    let live_db = get_db_path(project_root)?;
+    ensure_safe_live_db_artifacts(&live_db)?;
+    ensure_restore_staging_is_absent(staged_db)?;
+    let source = Connection::open_with_flags(&live_db, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| {
+            format!(
+                "failed to open published index {} for backup",
+                live_db.display()
+            )
+        })?;
+    let mut destination = Connection::open(staged_db)
+        .with_context(|| format!("failed to create staged index {}", staged_db.display()))?;
+    {
+        let backup = Backup::new(&source, &mut destination)?;
+        backup.step(-1)?;
+    }
+    // Reopen with the normal staged configuration only after a complete
+    // snapshot exists. Migrations, core mutations and graph refresh operate
+    // exclusively on this private generation.
+    drop(destination);
+    let normalized_root = normalize_root_for_storage(project_root);
+    open_configured_connection(&normalized_root, staged_db)
+}
+
 /// Consolidate a completed private generation into one durable main file.
 /// Consuming the connection makes it impossible for a caller to retain a
 /// SQLite handle across publication and deadlock its own exclusive guard.
@@ -4456,6 +4575,102 @@ pub fn open_db_leased(project_root: &Path) -> Result<LeasedConnection> {
 
 /// Open an initialized live generation without ever creating a replacement
 /// database when the index is absent.
+/// Open an initialized generation strictly read-only. Unlike `open_db*`,
+/// this function never changes journal mode and never runs migrations/DDL;
+/// graph navigation commands must not turn a read request into a writer.
+pub fn open_existing_db_read_only_leased(project_root: &Path) -> Result<Option<LeasedConnection>> {
+    let (db_path, lease, _normalized_root) = resolve_db_path_and_lease(project_root)?;
+    let publication = try_acquire_shared_publication(&db_path, &lease)?;
+    ensure_no_interrupted_publication(&db_path)?;
+    if !std::fs::symlink_metadata(&db_path)
+        .map(|metadata| metadata.file_type().is_file())
+        .unwrap_or(false)
+    {
+        return Ok(None);
+    }
+    let connection = Connection::open_with_flags(
+        &db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    if !table_exists(&connection, "files")? {
+        return Ok(None);
+    }
+    Ok(Some(LeasedConnection {
+        connection,
+        _lease: lease,
+        _publication: publication,
+    }))
+}
+
+/// Read the optional fast-rebuild flag without mutating a legacy database.
+///
+/// This is used by `update` before it creates a private staging snapshot, so
+/// schema inspection and metadata SQL remain owned by the database layer.
+pub fn experimental_fast_rebuild_enabled_read_only(conn: &Connection) -> Result<bool> {
+    if !table_exists(conn, "metadata")? {
+        return Ok(false);
+    }
+    let value: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'experimental_fast_rebuild'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read metadata.experimental_fast_rebuild")?;
+    Ok(value.as_deref() == Some("1"))
+}
+
+pub fn django_graph_schema_exists(conn: &Connection) -> Result<bool> {
+    [
+        "django_endpoints",
+        "django_endpoint_handlers",
+        "django_serializer_models",
+        "django_symbol_settings",
+        "django_file_settings",
+        "django_handler_serializers",
+    ]
+    .into_iter()
+    .map(|table| table_exists(conn, table))
+    .collect::<Result<Vec<_>>>()
+    .map(|tables| tables.into_iter().all(|exists| exists))
+}
+
+/// Return whether the graph must be rebuilt even when the file manifest is unchanged.
+/// A marker distinguishes an intentionally empty graph from one never materialized.
+pub fn django_graph_materialization_required(conn: &Connection) -> Result<bool> {
+    if !django_graph_schema_exists(conn)? || !table_exists(conn, "metadata")? {
+        return Ok(true);
+    }
+    let marker: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'django_graph_materialized_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(marker.as_deref() != Some("1"))
+}
+
+/// Mark a graph extraction complete, including the valid case with zero facts.
+pub fn mark_django_graph_materialized(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO metadata (key, value) VALUES ('django_graph_materialized_v1', '1')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// Check whether opening this published generation would require a schema
+/// migration. This is SELECT/PRAGMA-only so callers can decide whether to
+/// allocate staging without mutating the live database.
+pub fn index_schema_migration_required(conn: &Connection, project_root: &Path) -> Result<bool> {
+    let normalized_root = normalize_root_for_storage(project_root);
+    let preflight = inspect_open_migrations(conn, &normalized_root)?;
+    Ok(preflight.functional_migration_required || preflight.optional_indexes.required())
+}
+
 pub fn open_existing_db_leased(project_root: &Path) -> Result<Option<LeasedConnection>> {
     let (db_path, lease, normalized_root) = resolve_db_path_and_lease(project_root)?;
     let publication = try_acquire_shared_publication(&db_path, &lease)?;
@@ -6669,15 +6884,43 @@ fn migrate_extra_roots_to_subtrees(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Get extra source roots without performing legacy migration. Update's live
+/// manifest preflight uses this before it creates staging, so it must remain
+/// safe on a read-only legacy database that has no `subtrees` table.
+pub fn get_extra_roots_read_only(conn: &Connection) -> Result<Vec<String>> {
+    if table_exists(conn, "subtrees")? {
+        return Ok(list_subtrees(conn)?
+            .into_iter()
+            .map(|subtree| subtree.canonical_path)
+            .collect());
+    }
+
+    if !table_exists(conn, "metadata")? {
+        return Ok(Vec::new());
+    }
+    let legacy: Option<String> = conn
+        .query_row(
+            "SELECT value FROM metadata WHERE key = 'extra_roots'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("failed to read legacy metadata.extra_roots")?;
+    legacy
+        .map(|json| {
+            serde_json::from_str(&json)
+                .context("metadata.extra_roots must be a JSON array of strings")
+        })
+        .transpose()
+        .map(Option::unwrap_or_default)
+}
+
 /// Get extra source roots — backwards-compatible shim over the new
 /// `subtrees` table. Returns the canonical_path of each subtree, ignoring
 /// the name (existing callers do not yet care about subtree names).
 pub fn get_extra_roots(conn: &Connection) -> Result<Vec<String>> {
     migrate_extra_roots_to_subtrees(conn)?;
-    Ok(list_subtrees(conn)?
-        .into_iter()
-        .map(|s| s.canonical_path)
-        .collect())
+    get_extra_roots_read_only(conn)
 }
 
 pub fn is_experimental_fast_rebuild_enabled_in_db(conn: &Connection) -> bool {
@@ -8700,4 +8943,1034 @@ mod tests {
             "api filter should return nothing when only implementation edge exists"
         );
     }
+}
+
+// === Django/DRF graph query API ===
+
+/// Result row for django.routes query
+#[derive(Debug, Serialize)]
+pub struct DjangoEndpointResult {
+    #[serde(skip)]
+    pub id: i64,
+    pub method: Option<String>,
+    pub path_pattern: String,
+    pub file_path: String,
+    pub root_path: Option<String>,
+    pub line: i64,
+    pub handler_qname: Option<String>,
+    pub confidence: Option<String>,
+}
+
+/// Result for django.endpoint-trace (endpoint -> handler -> serializer -> model)
+#[derive(Debug, Serialize)]
+pub struct DjangoEndpointTrace {
+    pub endpoint: DjangoEndpointResult,
+    pub handler: Option<SearchResult>,
+    pub serializer: Option<SearchResult>,
+    pub model: Option<SearchResult>,
+    pub settings: Vec<DjangoSettingUsage>,
+}
+
+/// Result row for django.setting-usage query
+#[derive(Debug, Serialize)]
+pub struct DjangoSettingUsage {
+    pub key: String,
+    pub key_kind: String,
+    pub symbol_name: String,
+    pub file_path: String,
+    pub root_path: Option<String>,
+    pub line: i64,
+    pub confidence: String,
+    pub reason: Option<String>,
+    /// Symbol ID for linking queries (not serialized to JSON)
+    #[serde(skip)]
+    pub symbol_id: i64,
+}
+
+/// Clear all materialized Django graph facts before rebuilding them from indexed files.
+pub fn clear_django_graph(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        r#"
+        DELETE FROM django_symbol_settings;
+        DELETE FROM django_file_settings;
+        DELETE FROM django_handler_serializers;
+        DELETE FROM django_serializer_models;
+        DELETE FROM django_endpoint_handlers;
+        DELETE FROM django_endpoints;
+        "#,
+    )?;
+    Ok(())
+}
+
+/// List the persisted file metadata used by incremental update preflight.
+pub fn list_indexed_file_metadata(conn: &Connection) -> Result<Vec<(String, String, i64, i64)>> {
+    let mut stmt = conn.prepare("SELECT root_path, path, mtime, size FROM files")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// List indexed Python files together with the root that owns each relative path.
+pub fn list_django_python_files(conn: &Connection) -> Result<Vec<(i64, String, String)>> {
+    let mut stmt = conn.prepare("SELECT id, path, root_path FROM files WHERE path LIKE '%.py'")?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Find a symbol by name in an indexed file.
+pub fn find_django_symbol_in_file(
+    conn: &Connection,
+    name: &str,
+    file_id: i64,
+    kind: Option<&str>,
+) -> Option<i64> {
+    match kind {
+        Some(kind) => conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 AND kind = ?3 LIMIT 1",
+                params![name, file_id, kind],
+                |row| row.get(0),
+            )
+            .ok(),
+        None => conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = ?1 AND file_id = ?2 LIMIT 1",
+                params![name, file_id],
+                |row| row.get(0),
+            )
+            .ok(),
+    }
+}
+
+/// Resolve an imported Django symbol by its exact indexed module path.
+pub fn find_django_symbol_by_path(
+    conn: &Connection,
+    name: &str,
+    path: &str,
+    root_path: Option<&str>,
+) -> Option<(i64, String)> {
+    conn.query_row(
+        r#"
+        SELECT s.id, f.path
+        FROM symbols s JOIN files f ON s.file_id = f.id
+        WHERE s.name = ?1 AND f.path = ?2 AND (?3 IS NULL OR f.root_path = ?3)
+        LIMIT 1
+        "#,
+        params![name, path, root_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Resolve an imported Django symbol by a module-path fallback pattern.
+pub fn find_django_symbol_by_path_pattern(
+    conn: &Connection,
+    name: &str,
+    path_pattern: &str,
+    root_path: Option<&str>,
+) -> Option<(i64, String)> {
+    conn.query_row(
+        r#"
+        SELECT s.id, f.path
+        FROM symbols s JOIN files f ON s.file_id = f.id
+        WHERE s.name = ?1 AND f.path LIKE ?2 AND (?3 IS NULL OR f.root_path = ?3)
+        LIMIT 1
+        "#,
+        params![name, path_pattern, root_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Resolve a Django class within the current root.
+pub fn find_django_class_in_root(
+    conn: &Connection,
+    name: &str,
+    root_path: Option<&str>,
+) -> Option<(i64, String)> {
+    conn.query_row(
+        "SELECT s.id, f.path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.name = ?1 AND s.kind = 'class' AND (?2 IS NULL OR f.root_path = ?2) LIMIT 1",
+        params![name, root_path],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Get the indexed path and owning root for a Django symbol.
+pub fn get_django_symbol_file(conn: &Connection, symbol_id: i64) -> Option<(String, String)> {
+    conn.query_row(
+        "SELECT f.path, f.root_path FROM symbols s JOIN files f ON s.file_id = f.id WHERE s.id = ?1",
+        params![symbol_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )
+    .ok()
+}
+
+/// Get the symbol name used as the endpoint handler label.
+pub fn get_django_symbol_name(conn: &Connection, symbol_id: i64) -> Option<String> {
+    conn.query_row(
+        "SELECT name FROM symbols WHERE id = ?1",
+        params![symbol_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Find every public router prefix for an action's ViewSet. A router can be
+/// included under multiple paths, all of which must materialize its actions.
+pub fn find_django_action_prefixes(
+    conn: &Connection,
+    class_name: &str,
+    file_id: i64,
+) -> Vec<String> {
+    let owner_symbol_id = find_django_symbol_in_file(conn, class_name, file_id, Some("class"));
+    let prefixes = owner_symbol_id
+        .and_then(|symbol_id| {
+            conn.prepare(
+                r#"
+                SELECT DISTINCT e.path_pattern
+                FROM django_endpoint_handlers eh
+                JOIN django_endpoints e ON eh.endpoint_id = e.id
+                WHERE eh.symbol_id = ?1 AND e.method IS NULL
+                ORDER BY e.path_pattern
+                "#,
+            )
+            .ok()
+            .and_then(|mut statement| {
+                statement
+                    .query_map(params![symbol_id], |row| row.get(0))
+                    .ok()
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>().ok())
+            })
+        })
+        .unwrap_or_default();
+
+    if !prefixes.is_empty() {
+        return prefixes;
+    }
+
+    conn.prepare(
+        "SELECT DISTINCT path_pattern FROM django_endpoints WHERE handler_qname = ?1 AND method IS NULL ORDER BY path_pattern",
+    )
+    .ok()
+    .and_then(|mut statement| {
+        statement
+            .query_map(params![class_name], |row| row.get(0))
+            .ok()
+            .and_then(|rows| rows.collect::<rusqlite::Result<Vec<String>>>().ok())
+    })
+    .unwrap_or_default()
+}
+
+/// Find the owner ViewSet class for a dispatched action endpoint.
+pub fn find_django_owner_class_symbol(
+    conn: &Connection,
+    name: &str,
+    path: &str,
+    root_path: Option<&str>,
+) -> Option<i64> {
+    conn.query_row(
+        r#"
+        SELECT s.id FROM symbols s JOIN files f ON s.file_id = f.id
+        WHERE s.kind = 'class' AND s.name = ?1 AND f.path = ?2
+          AND (?3 IS NULL OR f.root_path = ?3)
+        LIMIT 1
+        "#,
+        params![name, path, root_path],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Remove local URLConf fragments after their mounted instances are materialized.
+pub fn delete_django_unmounted_endpoint_fragments(
+    conn: &Connection,
+    file_ids: impl IntoIterator<Item = i64>,
+) -> Result<()> {
+    let file_ids: Vec<_> = file_ids.into_iter().collect();
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat("?")
+        .take(file_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    conn.execute(
+        &format!("DELETE FROM django_endpoints WHERE file_id IN ({placeholders})"),
+        rusqlite::params_from_iter(file_ids),
+    )?;
+    Ok(())
+}
+
+/// Insert a Django/DRF endpoint
+pub fn insert_django_endpoint(
+    conn: &Connection,
+    method: Option<&str>,
+    path_pattern: &str,
+    file_id: i64,
+    line: usize,
+    handler_qname: Option<&str>,
+) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO django_endpoints (method, path_pattern, file_id, line, handler_qname) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![method, path_pattern, file_id, line as i64, handler_qname],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// Resolve the method dispatched by a DRF `ViewSet.as_view` mapping.
+/// Methods live in the owner class's file; keeping this lookup here prevents
+/// graph-specific SQL leaking into extraction/command layers.
+pub fn find_django_owner_method_symbol(
+    conn: &Connection,
+    owner_symbol_id: i64,
+    method_name: &str,
+) -> Option<i64> {
+    // Python symbols do not currently persist parent_id. Constrain the method
+    // to the lexical span beginning at its owner class and ending at the next
+    // sibling class, so two ViewSets in one file may safely share `list`.
+    conn.query_row(
+        r#"
+        SELECT method.id
+        FROM symbols owner
+        JOIN symbols method ON method.file_id = owner.file_id
+        WHERE owner.id = ?1
+          AND method.name = ?2
+          AND method.kind = 'function'
+          AND method.line > owner.line
+          AND method.line < COALESCE((
+              SELECT MIN(next_class.line)
+              FROM symbols next_class
+              WHERE next_class.file_id = owner.file_id
+                AND next_class.kind = 'class'
+                AND next_class.line > owner.line
+          ), 9223372036854775807)
+        ORDER BY method.line
+        LIMIT 1
+        "#,
+        params![owner_symbol_id, method_name],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Resolve a class name or class-qualified method context in one indexed file.
+pub fn find_django_symbol_by_context(
+    conn: &Connection,
+    context: &str,
+    file_id: i64,
+) -> Option<i64> {
+    if let Some((owner_name, method_name)) = context.split_once('.') {
+        let owner_id = find_django_symbol_in_file(conn, owner_name, file_id, Some("class"))?;
+        return find_django_owner_method_symbol(conn, owner_id, method_name);
+    }
+    find_django_symbol_in_file(conn, context, file_id, None)
+}
+
+/// Insert endpoint -> handler symbol link
+pub fn insert_django_endpoint_handler(
+    conn: &Connection,
+    endpoint_id: i64,
+    symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO django_endpoint_handlers (endpoint_id, symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![endpoint_id, symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert serializer -> model link
+pub fn insert_django_serializer_model(
+    conn: &Connection,
+    serializer_symbol_id: i64,
+    model_symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO django_serializer_models (serializer_symbol_id, model_symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![serializer_symbol_id, model_symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert symbol -> settings key link
+pub fn insert_django_symbol_setting(
+    conn: &Connection,
+    symbol_id: i64,
+    key: &str,
+    key_kind: &str,
+    line: usize,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO django_symbol_settings (symbol_id, key, key_kind, line, confidence, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![symbol_id, key, key_kind, line as i64, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert module-level settings/env key usage
+pub fn insert_django_file_setting(
+    conn: &Connection,
+    file_id: i64,
+    key: &str,
+    key_kind: &str,
+    line: usize,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO django_file_settings (file_id, key, key_kind, line, confidence, reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![file_id, key, key_kind, line as i64, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Insert handler -> serializer direct link
+pub fn insert_django_handler_serializer(
+    conn: &Connection,
+    handler_symbol_id: i64,
+    serializer_symbol_id: i64,
+    confidence: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO django_handler_serializers (handler_symbol_id, serializer_symbol_id, confidence, reason) VALUES (?1, ?2, ?3, ?4)",
+        params![handler_symbol_id, serializer_symbol_id, confidence, reason],
+    )?;
+    Ok(())
+}
+
+/// Get serializer linked to handler via django_handler_serializers
+pub fn get_django_handler_serializer(
+    conn: &Connection,
+    handler_symbol_id: i64,
+) -> Result<Option<(i64, SearchResult, String)>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, f.root_path, hs.confidence
+        FROM django_handler_serializers hs
+        JOIN symbols s ON hs.serializer_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE hs.handler_symbol_id = ?1
+        ORDER BY CASE hs.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END
+        LIMIT 1
+        "#,
+        params![handler_symbol_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                    qualified_name: None,
+                    root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+                },
+                row.get::<_, String>(7)?,
+            ))
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Count Django/DRF endpoints with the same query and root scope as routes.
+pub fn count_django_endpoints(
+    conn: &Connection,
+    query: Option<&str>,
+    root_path: Option<&str>,
+) -> Result<usize> {
+    let count: i64 = if let Some(q) = query {
+        let pattern = format!("%{}%", q.to_lowercase());
+        conn.query_row(
+            r#"
+            SELECT COUNT(*) FROM django_endpoints e
+            JOIN files f ON e.file_id = f.id
+            WHERE (LOWER(e.path_pattern) LIKE ?1
+               OR LOWER(COALESCE(e.handler_qname, '')) LIKE ?1)
+              AND (?2 IS NULL OR f.root_path = ?2)
+            "#,
+            params![pattern, root_path],
+            |row| row.get(0),
+        )?
+    } else {
+        conn.query_row(
+            "SELECT COUNT(*) FROM django_endpoints e JOIN files f ON e.file_id = f.id WHERE ?1 IS NULL OR f.root_path = ?1",
+            params![root_path],
+            |row| row.get(0),
+        )?
+    };
+    Ok(count as usize)
+}
+
+/// Get Django/DRF endpoints with limit and optional filter (for django.routes)
+pub fn get_django_endpoints(
+    conn: &Connection,
+    query: Option<&str>,
+    root_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DjangoEndpointResult>> {
+    let pattern = query.map(|q| format!("%{}%", q.to_lowercase()));
+
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DjangoEndpointResult> {
+        Ok(DjangoEndpointResult {
+            id: row.get(0)?,
+            method: row.get(1)?,
+            path_pattern: row.get(2)?,
+            file_path: row.get(3)?,
+            root_path: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            line: row.get(5)?,
+            handler_qname: row.get(6)?,
+            confidence: row.get(7)?,
+        })
+    };
+
+    let results = if let Some(ref pat) = pattern {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, f.root_path, e.line, e.handler_qname,
+                   (
+                       SELECT h.confidence
+                       FROM django_endpoint_handlers h
+                       WHERE h.endpoint_id = e.id
+                       ORDER BY CASE h.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, h.id
+                       LIMIT 1
+                   ) AS confidence
+            FROM django_endpoints e
+            JOIN files f ON e.file_id = f.id
+            WHERE (LOWER(e.path_pattern) LIKE ?1
+               OR LOWER(COALESCE(e.handler_qname, '')) LIKE ?1)
+              AND (?2 IS NULL OR f.root_path = ?2)
+            ORDER BY e.path_pattern, e.method
+            LIMIT ?3
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![pat, root_path, limit as i64], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    } else {
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, f.root_path, e.line, e.handler_qname,
+                   (
+                       SELECT h.confidence
+                       FROM django_endpoint_handlers h
+                       WHERE h.endpoint_id = e.id
+                       ORDER BY CASE h.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, h.id
+                       LIMIT 1
+                   ) AS confidence
+            FROM django_endpoints e
+            JOIN files f ON e.file_id = f.id
+            WHERE ?1 IS NULL OR f.root_path = ?1
+            ORDER BY e.path_pattern, e.method
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = stmt
+            .query_map(params![root_path, limit as i64], map_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    Ok(results)
+}
+
+/// Find endpoint by method + path pattern (for django.endpoint-trace)
+pub fn find_django_endpoint(
+    conn: &Connection,
+    method: Option<&str>,
+    path_pattern: &str,
+) -> Result<Vec<DjangoEndpointResult>> {
+    let (sql, normalized_method) = if let Some(method) = method {
+        (
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, f.root_path, e.line, e.handler_qname,
+                   (
+                       SELECT h.confidence
+                       FROM django_endpoint_handlers h
+                       WHERE h.endpoint_id = e.id
+                       ORDER BY CASE h.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, h.id
+                       LIMIT 1
+                   ) AS confidence
+            FROM django_endpoints e
+            JOIN files f ON e.file_id = f.id
+            WHERE UPPER(e.method) = ?1 AND e.path_pattern LIKE ?2
+            ORDER BY e.path_pattern
+            "#,
+            Some(method.to_ascii_uppercase()),
+        )
+    } else {
+        (
+            r#"
+            SELECT e.id, e.method, e.path_pattern, f.path, f.root_path, e.line, e.handler_qname,
+                   (
+                       SELECT h.confidence
+                       FROM django_endpoint_handlers h
+                       WHERE h.endpoint_id = e.id
+                       ORDER BY CASE h.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, h.id
+                       LIMIT 1
+                   ) AS confidence
+            FROM django_endpoints e
+            JOIN files f ON e.file_id = f.id
+            WHERE e.path_pattern LIKE ?1
+            ORDER BY e.path_pattern
+            "#,
+            None,
+        )
+    };
+
+    let mut stmt = conn.prepare(sql)?;
+    let pattern = format!("%{}%", path_pattern);
+    let map_row = |row: &rusqlite::Row| -> rusqlite::Result<DjangoEndpointResult> {
+        Ok(DjangoEndpointResult {
+            id: row.get(0)?,
+            method: row.get(1)?,
+            path_pattern: row.get(2)?,
+            file_path: row.get(3)?,
+            root_path: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+            line: row.get(5)?,
+            handler_qname: row.get(6)?,
+            confidence: row.get(7)?,
+        })
+    };
+
+    let results = if let Some(method) = normalized_method {
+        stmt.query_map(params![method, pattern], map_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        stmt.query_map(params![pattern], map_row)?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    Ok(results)
+}
+
+/// Get handler symbol for an endpoint
+pub fn get_django_endpoint_handler(
+    conn: &Connection,
+    endpoint_id: i64,
+) -> Result<Option<SearchResult>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM django_endpoint_handlers eh
+        JOIN symbols s ON eh.symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE eh.endpoint_id = ?1
+        ORDER BY CASE eh.confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, eh.id
+        LIMIT 1
+        "#,
+        params![endpoint_id],
+        |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+                qualified_name: None,
+                root_path: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+            })
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Get linked serializer -> model for a symbol_id
+pub fn get_django_serializer_model(
+    conn: &Connection,
+    symbol_id: i64,
+) -> Result<Option<SearchResult>> {
+    let result = conn.query_row(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM django_serializer_models sm
+        JOIN symbols s ON sm.model_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE sm.serializer_symbol_id = ?1
+        LIMIT 1
+        "#,
+        params![symbol_id],
+        |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+                qualified_name: None,
+                root_path: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+            })
+        },
+    );
+
+    match result {
+        Ok(r) => Ok(Some(r)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Find settings/env key usages (for django.setting-usage)
+pub fn find_django_setting_usages(
+    conn: &Connection,
+    key: &str,
+    root_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<DjangoSettingUsage>> {
+    let pattern = format!("%{}%", key);
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT key, key_kind, symbol_name, file_path, root_path, line, confidence, reason, symbol_id
+        FROM (
+            SELECT ps.key AS key, ps.key_kind AS key_kind, s.name AS symbol_name, f.path AS file_path,
+                   f.root_path AS root_path, ps.line AS line, ps.confidence AS confidence,
+                   ps.reason AS reason, s.id AS symbol_id
+            FROM django_symbol_settings ps
+            JOIN symbols s ON ps.symbol_id = s.id
+            JOIN files f ON s.file_id = f.id
+            WHERE ps.key LIKE ?1 AND (?2 IS NULL OR f.root_path = ?2)
+
+            UNION ALL
+
+            SELECT fs.key AS key, fs.key_kind AS key_kind, '<module>' AS symbol_name, f.path AS file_path,
+                   f.root_path AS root_path, fs.line AS line, fs.confidence AS confidence,
+                   fs.reason AS reason, 0 AS symbol_id
+            FROM django_file_settings fs
+            JOIN files f ON fs.file_id = f.id
+            WHERE fs.key LIKE ?1 AND (?2 IS NULL OR f.root_path = ?2)
+        )
+        ORDER BY key, file_path, line
+        LIMIT ?3
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![pattern, root_path, limit as i64], |row| {
+            Ok(DjangoSettingUsage {
+                key: row.get(0)?,
+                key_kind: row.get(1)?,
+                symbol_name: row.get(2)?,
+                file_path: row.get(3)?,
+                root_path: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+                line: row.get(5)?,
+                confidence: row.get(6)?,
+                reason: row.get(7)?,
+                symbol_id: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Get settings for a symbol_id (for endpoint-trace)
+pub fn get_django_symbol_settings(
+    conn: &Connection,
+    symbol_id: i64,
+) -> Result<Vec<DjangoSettingUsage>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT ps.key, ps.key_kind, s.name, f.path, f.root_path, ps.line, ps.confidence, ps.reason, s.id
+        FROM django_symbol_settings ps
+        JOIN symbols s ON ps.symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE ps.symbol_id = ?1
+        ORDER BY ps.key, ps.line
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![symbol_id], |row| {
+            Ok(DjangoSettingUsage {
+                key: row.get(0)?,
+                key_kind: row.get(1)?,
+                symbol_name: row.get(2)?,
+                file_path: row.get(3)?,
+                root_path: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+                line: row.get(5)?,
+                confidence: row.get(6)?,
+                reason: row.get(7)?,
+                symbol_id: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+// === django.model-impact query API ===
+
+/// Result for django.model-impact: model -> serializers -> handlers -> endpoints
+#[derive(Debug, Serialize)]
+pub struct DjangoModelImpact {
+    pub model: SearchResult,
+    pub serializers: Vec<DjangoModelSerializerImpact>,
+}
+
+/// Serializer impact entry for model-impact
+#[derive(Debug, Serialize)]
+pub struct DjangoModelSerializerImpact {
+    pub serializer: SearchResult,
+    pub confidence: String,
+    pub handlers: Vec<DjangoModelHandlerImpact>,
+}
+
+/// Handler + endpoints for model-impact
+#[derive(Debug, Serialize)]
+pub struct DjangoModelHandlerImpact {
+    pub handler: SearchResult,
+    pub endpoints: Vec<DjangoEndpointResult>,
+}
+
+/// Find model symbols by name (prefer models.py files)
+pub fn find_django_model_symbols(
+    conn: &Connection,
+    name: &str,
+    root_path: Option<&str>,
+    limit: usize,
+) -> Result<Vec<(i64, SearchResult)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE s.name = ?1 AND s.kind = 'class'
+          AND (?2 IS NULL OR f.root_path = ?2)
+        ORDER BY
+            CASE WHEN f.path LIKE '%models.py' OR f.path LIKE '%models/%' THEN 0 ELSE 1 END,
+            f.path
+        LIMIT ?3
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![name, root_path, limit as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                    qualified_name: None,
+                    root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find serializers linked to a model symbol (via django_serializer_models)
+pub fn find_django_serializers_for_model(
+    conn: &Connection,
+    model_symbol_id: i64,
+) -> Result<Vec<(i64, SearchResult, String)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, f.root_path, sm.confidence
+        FROM django_serializer_models sm
+        JOIN symbols s ON sm.serializer_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE sm.model_symbol_id = ?1
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![model_symbol_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                    qualified_name: None,
+                    root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+                },
+                row.get::<_, String>(7)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find handlers linked to a serializer (via django_handler_serializers)
+pub fn find_django_handlers_for_serializer(
+    conn: &Connection,
+    serializer_symbol_id: i64,
+) -> Result<Vec<(i64, SearchResult)>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT s.id, s.name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM django_handler_serializers hs
+        JOIN symbols s ON hs.handler_symbol_id = s.id
+        JOIN files f ON s.file_id = f.id
+        WHERE hs.serializer_symbol_id = ?1
+        ORDER BY f.path, s.line
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![serializer_symbol_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SearchResult {
+                    name: row.get(1)?,
+                    kind: row.get(2)?,
+                    line: row.get(3)?,
+                    signature: row.get(4)?,
+                    path: row.get(5)?,
+                    qualified_name: None,
+                    root_path: row.get::<_, Option<String>>(6)?.filter(|s| !s.is_empty()),
+                },
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
+}
+
+/// Find the best handler symbol id linked to an endpoint.
+pub fn find_django_endpoint_handler_symbol_id(conn: &Connection, endpoint_id: i64) -> Option<i64> {
+    conn.query_row(
+        r#"
+        SELECT symbol_id
+        FROM django_endpoint_handlers
+        WHERE endpoint_id = ?1
+        ORDER BY CASE confidence WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, id
+        LIMIT 1
+        "#,
+        params![endpoint_id],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+/// Find serializer references within one handler's lexical method span.
+pub fn find_django_serializer_refs_for_handler(
+    conn: &Connection,
+    handler_symbol_id: i64,
+) -> Vec<(String, i64)> {
+    conn.prepare(
+        r#"
+        WITH handler AS (
+            SELECT file_id, line FROM symbols WHERE id = ?1
+        ), method_end AS (
+            SELECT COALESCE(MIN(next_method.line), 9223372036854775807) AS line
+            FROM symbols next_method, handler
+            WHERE next_method.file_id = handler.file_id
+              AND next_method.kind = 'function'
+              AND next_method.line > handler.line
+        )
+        SELECT r.name, s.id
+        FROM refs r
+        JOIN handler ON r.file_id = handler.file_id
+        JOIN method_end ON 1 = 1
+        JOIN symbols s ON s.name = r.name AND s.kind = 'class'
+        WHERE r.line >= handler.line
+          AND r.line < method_end.line
+          AND EXISTS (
+              SELECT 1 FROM django_serializer_models sm WHERE sm.serializer_symbol_id = s.id
+          )
+        ORDER BY r.line, s.id
+        LIMIT 5
+        "#,
+    )
+    .ok()
+    .and_then(|mut stmt| {
+        stmt.query_map(params![handler_symbol_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .ok()
+        .map(|rows| rows.filter_map(|row| row.ok()).collect())
+    })
+    .unwrap_or_default()
+}
+
+/// Get a symbol search result by stable in-database symbol id.
+pub fn get_django_symbol(conn: &Connection, symbol_id: i64) -> Option<SearchResult> {
+    conn.query_row(
+        r#"
+        SELECT s.name, s.kind, s.line, s.signature, f.path, f.root_path
+        FROM symbols s
+        JOIN files f ON s.file_id = f.id
+        WHERE s.id = ?1
+        "#,
+        params![symbol_id],
+        |row| {
+            Ok(SearchResult {
+                name: row.get(0)?,
+                kind: row.get(1)?,
+                line: row.get(2)?,
+                signature: row.get(3)?,
+                path: row.get(4)?,
+                qualified_name: None,
+                root_path: row.get::<_, Option<String>>(5)?.filter(|s| !s.is_empty()),
+            })
+        },
+    )
+    .ok()
+}
+
+pub fn find_django_endpoints_for_handler(
+    conn: &Connection,
+    handler_symbol_id: i64,
+) -> Result<Vec<DjangoEndpointResult>> {
+    let mut stmt = conn.prepare(
+        r#"
+        SELECT e.id, e.method, e.path_pattern, f.path, f.root_path, e.line, e.handler_qname, eh.confidence
+        FROM django_endpoint_handlers eh
+        JOIN django_endpoints e ON eh.endpoint_id = e.id
+        JOIN files f ON e.file_id = f.id
+        WHERE eh.symbol_id = ?1
+        ORDER BY e.path_pattern, e.method
+        "#,
+    )?;
+
+    let results = stmt
+        .query_map(params![handler_symbol_id], |row| {
+            Ok(DjangoEndpointResult {
+                id: row.get(0)?,
+                method: row.get(1)?,
+                path_pattern: row.get(2)?,
+                file_path: row.get(3)?,
+                root_path: row.get::<_, Option<String>>(4)?.filter(|s| !s.is_empty()),
+                line: row.get(5)?,
+                handler_qname: row.get(6)?,
+                confidence: row.get(7)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(results)
 }

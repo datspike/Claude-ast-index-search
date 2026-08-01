@@ -13,6 +13,7 @@
 pub mod analysis;
 pub mod android;
 pub mod changed;
+pub mod django;
 pub mod explore;
 pub mod files;
 pub mod grep;
@@ -72,12 +73,9 @@ impl PathResolver {
             .unwrap_or_else(|_| Self::from_subtrees(primary, Vec::new()))
     }
 
-    /// Build a resolver while propagating subtree metadata errors.
+    /// Build a resolver while propagating subtree metadata errors. This is a
+    /// read-only operation: migrations belong exclusively to mutation paths.
     pub fn try_from_conn(primary: &Path, conn: &Connection) -> Result<Self> {
-        // Direct pre-3.47 connections have not gone through open_db's eager
-        // migration. The compatibility shim upgrades metadata.extra_roots
-        // transactionally before we read the named subtree rows.
-        db::get_extra_roots(conn)?;
         Ok(Self::from_subtrees(primary, db::list_subtrees(conn)?))
     }
 
@@ -146,6 +144,26 @@ impl PathResolver {
             return self.subtree_name(root_path) == Some(name.as_str());
         }
         true
+    }
+
+    /// Return the stored root key selected by the current subtree/local scope.
+    /// Query helpers use this to apply the scope in SQLite before LIMIT. An
+    /// unknown named subtree intentionally returns an impossible root key,
+    /// rather than `None`, because `None` means an unscoped SQL query.
+    pub fn active_root_path(&self) -> Option<&str> {
+        const UNKNOWN_SUBTREE_ROOT: &str = "\0";
+
+        if std::env::var("AST_INDEX_LOCAL_SCOPE").is_ok() {
+            return Some(&self.primary_key);
+        }
+        let name = std::env::var("AST_INDEX_SUBTREE").ok()?;
+        Some(
+            self.subtree_names
+                .iter()
+                .find(|(_, subtree_name)| subtree_name == &name)
+                .map(|(canonical_path, _)| canonical_path.as_str())
+                .unwrap_or(UNKNOWN_SUBTREE_ROOT),
+        )
     }
 
     /// Format a path for human-readable output: prefixes `[name] ` when the
@@ -274,6 +292,16 @@ pub fn try_is_experimental_fast_rebuild_enabled(root: &Path) -> Result<bool> {
         .optional()
         .context("failed to read metadata.experimental_fast_rebuild")?;
     Ok(value.as_deref() == Some("1"))
+}
+
+/// Read the fast-rebuild flag from a published generation without migrating
+/// it. `update` calls this before creating its staged snapshot, so any legacy
+/// DDL remains confined to the staged generation.
+pub fn try_is_experimental_fast_rebuild_enabled_read_only(root: &Path) -> Result<bool> {
+    let Some(conn) = db::open_existing_db_read_only_leased(root)? else {
+        return Ok(false);
+    };
+    db::experimental_fast_rebuild_enabled_read_only(&conn)
 }
 
 /// Get number of available CPU cores

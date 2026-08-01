@@ -2,7 +2,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
 use rusqlite::Connection;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1972,6 +1972,126 @@ fn write_batch_to_db(
 
     tx.commit()?;
     Ok(())
+}
+
+/// Return whether the current filesystem differs from the indexed file manifest.
+///
+/// This read-only preflight lets `update` avoid allocating a private SQLite
+/// generation when there is nothing to publish. It intentionally shares the
+/// same root/include/exclude traversal rules as the mutating update path.
+pub fn incremental_update_has_changes(
+    conn: &Connection,
+    root: &Path,
+    include: Option<&[String]>,
+    exclude_matcher: Option<&ignore::gitignore::Gitignore>,
+) -> Result<bool> {
+    use ignore::WalkBuilder;
+
+    let existing = db::list_indexed_file_metadata(conn)?
+        .into_iter()
+        .map(|(root_path, path, mtime, size)| ((root_path, path), (mtime, size)))
+        .collect::<HashMap<_, _>>();
+
+    let mut walk_specs = Vec::new();
+    match include {
+        Some(includes) if !includes.is_empty() => {
+            for include in includes {
+                let path = root.join(include);
+                if path.is_dir() {
+                    walk_specs.push((path, root.to_path_buf()));
+                }
+            }
+        }
+        _ => walk_specs.push((root.to_path_buf(), root.to_path_buf())),
+    }
+    for extra_root in db::get_extra_roots_read_only(conn)? {
+        let path = PathBuf::from(extra_root);
+        if path.exists() {
+            walk_specs.push((path.clone(), path));
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for (walk_dir, anchor) in walk_specs {
+        let is_git = has_git_repo(&walk_dir) || has_git_repo(&anchor);
+        let arc_root = find_arc_root(&walk_dir).or_else(|| find_arc_root(&anchor));
+        let mut builder = WalkBuilder::new(&walk_dir);
+        let matcher = exclude_matcher.cloned();
+        builder
+            .hidden(true)
+            .git_ignore(is_git)
+            .filter_entry(move |entry| {
+                if is_excluded_dir(entry) {
+                    return false;
+                }
+                matcher.as_ref().map_or(true, |matcher| {
+                    !matcher
+                        .matched(
+                            entry.path(),
+                            entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false),
+                        )
+                        .is_ignore()
+                })
+            });
+        if let Some(arc_root) = arc_root {
+            builder.add_custom_ignore_filename(".gitignore");
+            builder.add_custom_ignore_filename(".arcignore");
+            let root_gitignore = arc_root.join(".gitignore");
+            if root_gitignore.exists() {
+                builder.add_ignore(root_gitignore);
+            }
+        }
+        for entry in builder.build().filter_map(|entry| entry.ok()) {
+            if !entry
+                .path()
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(parsers::is_supported_extension)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let rel_path = path
+                .strip_prefix(&anchor)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            let root_path = db::normalize_root_for_storage(&anchor);
+            let metadata = fs::metadata(path).ok();
+            let mtime = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.modified().ok())
+                .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_secs() as i64)
+                .unwrap_or(0);
+            let size = metadata.map(|metadata| metadata.len() as i64).unwrap_or(0);
+            match existing.get(&(root_path.clone(), rel_path.clone())) {
+                Some((indexed_mtime, indexed_size))
+                    if *indexed_mtime == mtime && *indexed_size == size => {}
+                _ => return Ok(true),
+            }
+            seen.insert((root_path, rel_path));
+        }
+    }
+    let root_path = db::normalize_root_for_storage(root);
+    for (path, rel_path) in collect_node_modules_dts_files(root) {
+        let metadata = fs::metadata(path).ok();
+        let mtime = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let size = metadata.map(|metadata| metadata.len() as i64).unwrap_or(0);
+        match existing.get(&(root_path.clone(), rel_path.clone())) {
+            Some((indexed_mtime, indexed_size))
+                if *indexed_mtime == mtime && *indexed_size == size => {}
+            _ => return Ok(true),
+        }
+        seen.insert((root_path.clone(), rel_path));
+    }
+    Ok(seen.len() != existing.len())
 }
 
 /// Incremental update: only re-index changed/new files, delete removed files.
@@ -4947,4 +5067,1886 @@ no_ignore: true
         assert_eq!(samples.len(), 1);
         assert!(samples[0].ends_with("src/Main.java"));
     }
+}
+
+// === Django/DRF/settings extraction pipeline ===
+
+/// Extracted Django/DRF endpoint
+#[derive(Debug, Clone)]
+pub struct ExtractedEndpoint {
+    pub method: Option<String>,
+    pub path_pattern: String,
+    pub line: usize,
+    pub handler_qname: Option<String>,
+    /// DRF `ViewSet.as_view({"get": "list"})` action dispatched for this
+    /// HTTP method. The endpoint must link to this method, not just the owner.
+    pub action_name: Option<String>,
+    /// Router registrations are emitted only through an `include(router.urls)` mount.
+    pub router_generated: bool,
+    /// Local variable owning this `router.register` call. It distinguishes
+    /// multiple routers declared in the same URLConf.
+    pub router_name: Option<String>,
+}
+
+/// Extracted Django/DRF @action endpoint before router prefix resolution
+#[derive(Debug, Clone)]
+pub struct ExtractedAction {
+    pub method: Option<String>,
+    pub path_suffix: String,
+    pub line: usize,
+    pub handler_name: Option<String>,
+    pub owner_class: Option<String>,
+    pub detail: bool,
+}
+
+/// Extracted serializer -> model relationship
+#[derive(Debug)]
+#[allow(dead_code)] // `line` field reserved for future diagnostics output
+pub struct ExtractedSerializerModel {
+    pub serializer_name: String,
+    pub model_name: String,
+    pub line: usize,
+}
+
+/// Extracted settings/env usage
+#[derive(Debug)]
+pub struct ExtractedSettingUsage {
+    pub key: String,
+    pub key_kind: String, // "settings", "env", "env_default"
+    pub line: usize,
+    pub context_symbol: Option<String>, // nearest function/class name
+}
+
+/// Regex patterns for extraction
+static DJANGO_URL_PATH_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // path("route/", view, name="..."), re_path(r"^route/$", view)
+    Regex::new(r#"\b(?:re_)?path\s*\("#).unwrap()
+});
+
+static DJANGO_ROUTER_REGISTER_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // router.register(r"users", UserViewSet, basename="user")
+    Regex::new(r#"\b([a-zA-Z_][a-zA-Z0-9_]*)\.register\s*\("#).unwrap()
+});
+
+static DJANGO_TUPLE_ENDPOINT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // ("prefix", SomeViewSet) or ("prefix", SomeView) — tuple lists of endpoints
+    Regex::new(r#"\(\s*["']([^"']+)["']\s*,\s*([A-Z][a-zA-Z0-9_]*(?:ViewSet|View))\b"#).unwrap()
+});
+
+static DJANGO_ACTION_START_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Start only at a code line; balanced parsing handles multiline arguments.
+    Regex::new(r#"(?m)^\s*@action\s*\("#).unwrap()
+});
+
+static DJANGO_AS_VIEW_METHOD_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // SomeViewSet.as_view({"get": "list", "post": "create"})
+    Regex::new(r#"["']([A-Za-z]+)["']\s*:\s*["']([A-Za-z_][A-Za-z0-9_]*)["']"#).unwrap()
+});
+
+static DJANGO_ACTION_METHODS_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"methods\s*=\s*\[([^\]]*)\]"#).unwrap());
+
+static DJANGO_ACTION_URL_PATH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"url_path\s*=\s*["']([^"']+)["']"#).unwrap());
+
+static DJANGO_ACTION_DETAIL_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"detail\s*=\s*(True|False)"#).unwrap());
+
+static DJANGO_URLPATTERNS_ROUTER_URLS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?m)^\s*urlpatterns\s*=\s*([a-zA-Z_][a-zA-Z0-9_]*)\.urls\s*$"#).unwrap()
+});
+
+static DJANGO_META_MODEL_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // model = User / model = models.User
+    Regex::new(r#"^\s*model\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#).unwrap()
+});
+
+static DJANGO_SETTINGS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // settings.SOME_KEY, django.conf.settings.KEY
+    Regex::new(r#"settings\.([A-Z][A-Z0-9_]+)"#).unwrap()
+});
+
+static DJANGO_GETENV_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"os\.(getenv|environ\.get)\s*\("#).unwrap());
+
+static DJANGO_ENVIRON_INDEX_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"os\.environ\s*\["#).unwrap());
+
+static DJANGO_ENV_START_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"\b(env|config)\s*(?:\.\w+)?\s*\("#).unwrap());
+
+static DJANGO_FROM_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // from X.Y.Z import A, B, C as D; also handles `from .foo import Bar`
+    // and a bare relative package import such as `from . import models`.
+    Regex::new(r#"^from\s+((?:\.{1,3}(?:[a-zA-Z_][a-zA-Z0-9_.]*)?)|(?:[a-zA-Z_][a-zA-Z0-9_.]*))\s+import\s+(.+)"#).unwrap()
+});
+
+static DJANGO_PLAIN_IMPORT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // import X.Y.Z [as W]
+    Regex::new(r#"^import\s+([a-zA-Z_][a-zA-Z0-9_.]+)(\s+as\s+([a-zA-Z_]\w*))?"#).unwrap()
+});
+
+static DJANGO_IMPORT_AS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // A as B (within import list)
+    Regex::new(r#"^\s*([a-zA-Z_]\w*)\s+as\s+([a-zA-Z_]\w*)\s*$"#).unwrap()
+});
+
+static DJANGO_SERIALIZER_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // serializer_class = UserSerializer
+    Regex::new(r#"serializer_class\s*=\s*([a-zA-Z_][a-zA-Z0-9_.]*)"#).unwrap()
+});
+
+static DJANGO_GET_SERIALIZER_CLASS_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // def get_serializer_class(...): ... return UserSerializer
+    Regex::new(r#"return\s+([A-Z][a-zA-Z0-9_]*Serializer)\b"#).unwrap()
+});
+
+/// Удаляет Python-комментарии, сохраняя активные строковые литералы, offsets и newlines.
+/// Это позволяет разобрать реальные decorator arguments, не считая аргументы в comments.
+fn mask_python_comments(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut triple = false;
+    let mut escaped = false;
+
+    while i < bytes.len() {
+        if let Some(active_quote) = quote {
+            if triple
+                && i + 2 < bytes.len()
+                && bytes[i] == active_quote
+                && bytes[i + 1] == active_quote
+                && bytes[i + 2] == active_quote
+            {
+                quote = None;
+                triple = false;
+                i += 3;
+                continue;
+            }
+            if !triple && !escaped && bytes[i] == active_quote {
+                quote = None;
+            }
+            escaped = !escaped && bytes[i] == b'\\';
+            if bytes[i] != b'\\' {
+                escaped = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    masked[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                quote = Some(bytes[i]);
+                triple =
+                    i + 2 < bytes.len() && bytes[i + 1] == bytes[i] && bytes[i + 2] == bytes[i];
+                i += if triple { 3 } else { 1 };
+            }
+            _ => i += 1,
+        }
+    }
+
+    String::from_utf8(masked).unwrap_or_else(|_| content.to_string())
+}
+
+/// Маска Python-кода для Django-эвристик: строки и комментарии заменяются пробелами,
+/// а байтовые смещения и переносы строк сохраняются.
+fn mask_python_comments_and_strings(content: &str) -> String {
+    let bytes = content.as_bytes();
+    let mut masked = bytes.to_vec();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'#' => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    masked[i] = b' ';
+                    i += 1;
+                }
+            }
+            b'\'' | b'"' => {
+                let quote = bytes[i];
+                let triple = i + 2 < bytes.len() && bytes[i + 1] == quote && bytes[i + 2] == quote;
+                let start_len = if triple { 3 } else { 1 };
+                for j in i..(i + start_len).min(bytes.len()) {
+                    masked[j] = b' ';
+                }
+                i += start_len;
+                let mut escaped = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'\n' {
+                        if !triple {
+                            break;
+                        }
+                    } else {
+                        masked[i] = b' ';
+                    }
+
+                    if triple {
+                        if i + 2 < bytes.len()
+                            && bytes[i] == quote
+                            && bytes[i + 1] == quote
+                            && bytes[i + 2] == quote
+                        {
+                            masked[i] = b' ';
+                            masked[i + 1] = b' ';
+                            masked[i + 2] = b' ';
+                            i += 3;
+                            break;
+                        }
+                        i += 1;
+                    } else if escaped {
+                        escaped = false;
+                        i += 1;
+                    } else if bytes[i] == b'\\' {
+                        escaped = true;
+                        i += 1;
+                    } else if bytes[i] == quote {
+                        i += 1;
+                        break;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    String::from_utf8(masked).unwrap_or_else(|_| content.to_string())
+}
+
+/// Resolved Django/DRF import: local_name -> (module_path, original_name)
+#[derive(Debug, Clone)]
+pub struct DjangoImport {
+    pub local_name: String,    // name used in this file
+    pub module_path: String,   // dotted module path
+    pub original_name: String, // original name (before `as`)
+}
+
+/// Build import map for a Django/DRF file from its content.
+///
+/// Parses `import X`, `import X as Y`, `from A.B import C`, `from A.B import C as D`.
+/// Returns list of DjangoImport entries mapping local names to their source modules.
+pub fn build_django_import_map(content: &str) -> Vec<DjangoImport> {
+    let mut imports = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+
+        // skip comments and empty lines
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        // from X.Y import A, B as C
+        if let Some(caps) = DJANGO_FROM_IMPORT_RE.captures(trimmed) {
+            let module_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let names_str = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+
+            for name_part in names_str.split(',') {
+                let name_part = name_part.trim();
+                if name_part.is_empty() || name_part == "(" || name_part == ")" {
+                    continue;
+                }
+
+                if let Some(as_caps) = DJANGO_IMPORT_AS_RE.captures(name_part) {
+                    let original = as_caps.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+                    let alias = as_caps.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+                    if !original.is_empty() && !alias.is_empty() {
+                        imports.push(DjangoImport {
+                            local_name: alias.to_string(),
+                            module_path: if module_path.chars().all(|ch| ch == '.') {
+                                format!("{module_path}{original}")
+                            } else {
+                                module_path.to_string()
+                            },
+                            original_name: original.to_string(),
+                        });
+                    }
+                } else {
+                    let name = name_part
+                        .trim()
+                        .trim_end_matches(')')
+                        .trim_start_matches('(')
+                        .trim();
+                    if !name.is_empty()
+                        && name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_alphabetic() || c == '_')
+                            .unwrap_or(false)
+                    {
+                        imports.push(DjangoImport {
+                            local_name: name.to_string(),
+                            module_path: if module_path.chars().all(|ch| ch == '.') {
+                                format!("{module_path}{name}")
+                            } else {
+                                module_path.to_string()
+                            },
+                            original_name: name.to_string(),
+                        });
+                    }
+                }
+            }
+            continue;
+        }
+
+        // import X.Y.Z as W / import X.Y.Z
+        if let Some(caps) = DJANGO_PLAIN_IMPORT_RE.captures(trimmed) {
+            let full_path = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let alias = caps.get(3).map(|m| m.as_str());
+
+            if let Some(a) = alias {
+                imports.push(DjangoImport {
+                    local_name: a.trim().to_string(),
+                    module_path: full_path.to_string(),
+                    original_name: full_path.to_string(),
+                });
+            } else {
+                // import a.b.c -> local name is "a"
+                let local = full_path.split('.').next().unwrap_or(full_path);
+                imports.push(DjangoImport {
+                    local_name: local.to_string(),
+                    module_path: full_path.to_string(),
+                    original_name: full_path.to_string(),
+                });
+            }
+        }
+    }
+
+    imports
+}
+
+/// Resolve a name used in Django/DRF code to its symbol_id via import map and DB.
+///
+/// Given name "UserSerializer" used in a file, look up:
+/// 1. Is it directly imported? (from X import UserSerializer)
+/// 2. If imported, find the source module and symbol
+/// 3. If not imported, fallback to global name match
+pub fn resolve_django_name_to_symbol(
+    conn: &rusqlite::Connection,
+    name: &str,
+    import_map: &[DjangoImport],
+    current_rel_path: &str,
+    current_root_path: Option<&str>,
+) -> Option<(i64, String)> {
+    let (lookup_name, matching_imports): (&str, Vec<&DjangoImport>) =
+        if let Some((qualifier, member)) = name.split_once('.') {
+            // `models.User` retains the import alias. Resolve it through that
+            // exact module; falling back by bare `User` can link another app.
+            (
+                member.rsplit('.').next().unwrap_or(member),
+                import_map
+                    .iter()
+                    .filter(|import| import.local_name == qualifier)
+                    .collect(),
+            )
+        } else {
+            (
+                name,
+                import_map
+                    .iter()
+                    .filter(|import| import.local_name == name)
+                    .collect(),
+            )
+        };
+    // A relative import has app-local identity. An exact local miss must fail
+    // closed instead of linking a same-named symbol from another app.
+    let allow_root_fallback = !name.contains('.')
+        && !matching_imports
+            .iter()
+            .any(|import| import.module_path.starts_with('.'));
+
+    for imp in matching_imports {
+        for candidate_path in module_path_to_file_candidates(current_rel_path, &imp.module_path) {
+            if let Some(result) = db::find_django_symbol_by_path(
+                conn,
+                lookup_name,
+                &candidate_path,
+                current_root_path,
+            ) {
+                return Some(result);
+            }
+        }
+
+        // Relative imports are package-local. Pattern matching would turn a
+        // miss in `app_a/models.py` into a link to `app_b/models.py`.
+        if !imp.module_path.starts_with('.') {
+            let file_pattern = module_path_to_file_pattern(&imp.module_path);
+            if let Some(result) = db::find_django_symbol_by_path_pattern(
+                conn,
+                lookup_name,
+                &file_pattern,
+                current_root_path,
+            ) {
+                return Some(result);
+            }
+        }
+
+        // `from app.models import User` has a class import, while `import
+        // app.models as models` is a module import and must stay module-bound.
+        if !imp.module_path.starts_with('.') && imp.original_name == lookup_name {
+            if let Some(result) =
+                db::find_django_class_in_root(conn, lookup_name, current_root_path)
+            {
+                return Some(result);
+            }
+        }
+    }
+
+    allow_root_fallback
+        .then(|| db::find_django_class_in_root(conn, name, current_root_path))
+        .flatten()
+}
+
+fn module_path_to_file_candidates(current_rel_path: &str, module_path: &str) -> Vec<String> {
+    let module_path = module_path.trim();
+    if module_path.is_empty() {
+        return Vec::new();
+    }
+
+    let leading_dots = module_path.chars().take_while(|c| *c == '.').count();
+    let remainder = module_path.trim_start_matches('.');
+
+    let path_part = if leading_dots == 0 {
+        if remainder.is_empty() {
+            return Vec::new();
+        }
+        remainder.replace('.', "/")
+    } else {
+        let current_dir = Path::new(current_rel_path)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let mut components: Vec<String> = current_dir
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        let ascend = leading_dots.saturating_sub(1);
+        if ascend > components.len() {
+            return Vec::new();
+        }
+        components.truncate(components.len().saturating_sub(ascend));
+        if !remainder.is_empty() {
+            components.extend(remainder.split('.').map(str::to_string));
+        }
+        if components.is_empty() {
+            return Vec::new();
+        }
+        components.join("/")
+    };
+
+    vec![
+        format!("{}.py", path_part),
+        format!("{}/__init__.py", path_part),
+    ]
+}
+
+/// Convert Django/DRF module path to SQL LIKE pattern for file path matching
+fn module_path_to_file_pattern(module_path: &str) -> String {
+    let clean = module_path.trim_start_matches('.');
+    if clean.is_empty() {
+        return "%".to_string();
+    }
+    let path_part = clean.replace('.', "/");
+    format!("%{}%", path_part)
+}
+
+/// Extract serializer_class = X from handler file content.
+///
+/// Returns: Vec of (class_name, serializer_name, line_number).
+pub fn extract_django_handler_serializers(content: &str) -> Vec<(String, String, usize)> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    let mut current_class: Option<String> = None;
+    let mut class_indent = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+
+        // Track class scope
+        if stripped.starts_with("class ") {
+            if let Some(end) = stripped.find(['(', ':']) {
+                let name = stripped["class ".len()..end].trim();
+                current_class = Some(name.to_string());
+                class_indent = indent;
+            }
+            continue;
+        }
+
+        // Exit class scope
+        if current_class.is_some() && indent <= class_indent && !stripped.is_empty() {
+            current_class = None;
+        }
+
+        if let Some(ref cls_name) = current_class {
+            // serializer_class = SomeSerializer
+            if let Some(caps) = DJANGO_SERIALIZER_CLASS_RE.captures(stripped) {
+                let ser_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !ser_name.is_empty() {
+                    results.push((cls_name.clone(), ser_name.to_string(), i + 1));
+                }
+            }
+
+            // def get_serializer_class(...): ... return XSerializer
+            if let Some(caps) = DJANGO_GET_SERIALIZER_CLASS_RE.captures(stripped) {
+                let ser_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                if !ser_name.is_empty() {
+                    results.push((cls_name.clone(), ser_name.to_string(), i + 1));
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Return a 1-based line number for a byte offset in content.
+fn line_number_at(content: &str, byte_index: usize) -> usize {
+    content[..byte_index]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1
+}
+
+/// Find the end byte of a balanced Python call starting at an opening parenthesis.
+fn find_balanced_call(content: &str, open_paren: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (offset, ch) in content[open_paren..].char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(open_paren + offset + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+/// Split Python call arguments while preserving nested dict/list/call expressions.
+fn split_top_level_args(args: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+
+    for (index, ch) in args.char_indices() {
+        if let Some(q) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(args[start..index].trim().to_string());
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let tail = args[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail.to_string());
+    }
+
+    parts
+}
+
+/// Parse a Django string route argument, including raw string prefixes.
+fn parse_django_string_arg(arg: &str) -> Option<String> {
+    let trimmed = arg.trim().trim_start_matches('r').trim_start_matches('R');
+    let quote = trimmed.chars().next()?;
+    if quote != '\'' && quote != '"' {
+        return None;
+    }
+    let rest = &trimmed[quote.len_utf8()..];
+    let end = rest.find(quote)?;
+    Some(rest[..end].to_string())
+}
+
+/// Normalize a Django handler argument to the view or viewset qualified name.
+fn normalize_django_handler_arg(arg: &str) -> Option<String> {
+    let handler = arg
+        .trim()
+        .split(".as_view")
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_end_matches(')')
+        .trim();
+
+    if handler.is_empty() {
+        None
+    } else {
+        Some(handler.to_string())
+    }
+}
+
+fn extract_django_methods_from_handler_arg(arg: &str) -> Vec<(String, String)> {
+    if !arg.contains(".as_view") {
+        return Vec::new();
+    }
+
+    let mut methods = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for caps in DJANGO_AS_VIEW_METHOD_RE.captures_iter(arg) {
+        let (Some(method_match), Some(action_match)) = (caps.get(1), caps.get(2)) else {
+            continue;
+        };
+        let method = method_match.as_str().to_ascii_uppercase();
+        let action = action_match.as_str().to_string();
+        if seen.insert((method.clone(), action.clone())) {
+            methods.push((method, action));
+        }
+    }
+    methods
+}
+
+#[derive(Debug, Clone)]
+struct ExtractedInclude {
+    prefix: String,
+    module_path: String,
+    /// The router variable for `include(router.urls)`, if this is a router
+    /// mount rather than a normal URLConf include.
+    router_name: Option<String>,
+    line: usize,
+}
+
+fn extract_django_path_call_args(content: &str) -> Vec<(usize, Vec<String>)> {
+    let masked = mask_python_comments_and_strings(content);
+    let mut calls = Vec::new();
+
+    for mat in DJANGO_URL_PATH_RE.find_iter(&masked) {
+        let open_paren = mat.end() - 1;
+        let Some(close_paren) = find_balanced_call(content, open_paren) else {
+            continue;
+        };
+        let call_args = &content[open_paren + 1..close_paren - 1];
+        calls.push((mat.start(), split_top_level_args(call_args)));
+    }
+
+    calls
+}
+
+fn parse_django_include_module(arg: &str) -> Option<(String, Option<String>)> {
+    let trimmed = arg.trim();
+    let include_pos = trimmed.find("include")?;
+    let after_include = &trimmed[include_pos + "include".len()..];
+    let open_rel = after_include.find('(')?;
+    let open_paren = include_pos + "include".len() + open_rel;
+    let close_paren = find_balanced_call(trimmed, open_paren)?;
+    let include_args = split_top_level_args(&trimmed[open_paren + 1..close_paren - 1]);
+    include_args.first().and_then(|arg| {
+        parse_django_string_arg(arg)
+            .map(|module| (module, None))
+            .or_else(|| {
+                arg.trim()
+                    .strip_suffix(".urls")
+                    .map(str::trim)
+                    .filter(|router| !router.is_empty())
+                    .map(|router| ("__router_urls__".to_string(), Some(router.to_string())))
+            })
+    })
+}
+
+/// Extract `path()` and `re_path()` calls from Django URL modules.
+fn extract_django_path_calls(content: &str) -> Vec<ExtractedEndpoint> {
+    let mut endpoints = Vec::new();
+
+    for (start, args) in extract_django_path_call_args(content) {
+        if args.len() < 2 {
+            continue;
+        }
+        let Some(path) = parse_django_string_arg(&args[0]) else {
+            continue;
+        };
+
+        if parse_django_include_module(&args[1]).is_some() {
+            continue;
+        }
+
+        let line = line_number_at(content, start);
+        let handler_qname = normalize_django_handler_arg(&args[1]);
+        let methods = extract_django_methods_from_handler_arg(&args[1]);
+        if methods.is_empty() {
+            endpoints.push(ExtractedEndpoint {
+                method: None,
+                path_pattern: path,
+                line,
+                handler_qname,
+                action_name: None,
+                router_generated: false,
+                router_name: None,
+            });
+        } else {
+            for (method, action_name) in methods {
+                endpoints.push(ExtractedEndpoint {
+                    method: Some(method),
+                    path_pattern: path.clone(),
+                    line,
+                    handler_qname: handler_qname.clone(),
+                    action_name: Some(action_name),
+                    router_generated: false,
+                    router_name: None,
+                });
+            }
+        }
+    }
+
+    endpoints
+}
+
+fn extract_django_includes(content: &str) -> Vec<ExtractedInclude> {
+    let mut includes = Vec::new();
+    let masked = mask_python_comments_and_strings(content);
+    for router_urls in DJANGO_URLPATTERNS_ROUTER_URLS_RE.captures_iter(&masked) {
+        let (Some(full_match), Some(router_name)) = (
+            router_urls.get(0),
+            router_urls.get(1).map(|name| name.as_str().to_string()),
+        ) else {
+            continue;
+        };
+        includes.push(ExtractedInclude {
+            prefix: String::new(),
+            module_path: "__router_urls__".to_string(),
+            router_name: Some(router_name),
+            line: line_number_at(content, full_match.start()),
+        });
+    }
+
+    for (start, args) in extract_django_path_call_args(content) {
+        if args.len() < 2 {
+            continue;
+        }
+        let Some(prefix) = parse_django_string_arg(&args[0]) else {
+            continue;
+        };
+        let Some((module_path, router_name)) = parse_django_include_module(&args[1]) else {
+            continue;
+        };
+        includes.push(ExtractedInclude {
+            prefix,
+            module_path,
+            router_name,
+            line: line_number_at(content, start),
+        });
+    }
+
+    includes
+}
+
+/// Keep a handler reference intact so import-aware resolution can distinguish
+/// `a_views.UserViewSet` from another same-named class.
+fn normalize_django_handler_name(handler: &str) -> Option<String> {
+    let trimmed = handler.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// Return router actions proven by the local ViewSet declaration or known base.
+/// Unknown inheritance is omitted rather than inventing CRUD routes.
+fn extract_django_viewset_actions(content: &str, viewset: &str) -> HashSet<String> {
+    let class_name = viewset.rsplit('.').next().unwrap_or(viewset);
+    let masked = mask_python_comments_and_strings(content);
+    let lines: Vec<&str> = masked.lines().collect();
+    let mut actions = HashSet::new();
+
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let class_prefix = format!("class {class_name}");
+        if !trimmed.starts_with(&class_prefix)
+            || !trimmed[class_prefix.len()..].starts_with(['(', ':'])
+        {
+            continue;
+        }
+        let class_indent = line.len() - line.trim_start().len();
+        let bases = trimmed
+            .strip_prefix(&class_prefix)
+            .unwrap_or("")
+            .trim_start_matches('(')
+            .split(')')
+            .next()
+            .unwrap_or("");
+        if bases.contains("ReadOnlyModelViewSet") {
+            actions.extend(["list".to_string(), "retrieve".to_string()]);
+        } else if bases.contains("ModelViewSet") {
+            actions.extend(
+                [
+                    "list",
+                    "create",
+                    "retrieve",
+                    "update",
+                    "partial_update",
+                    "destroy",
+                ]
+                .into_iter()
+                .map(str::to_string),
+            );
+        }
+        for nested in lines.iter().skip(index + 1) {
+            let nested_trimmed = nested.trim();
+            if nested_trimmed.is_empty() {
+                continue;
+            }
+            let indent = nested.len() - nested.trim_start().len();
+            if indent <= class_indent {
+                break;
+            }
+            for prefix in ["def ", "async def "] {
+                if let Some(rest) = nested_trimmed.strip_prefix(prefix) {
+                    if let Some(paren) = rest.find('(') {
+                        actions.insert(rest[..paren].to_string());
+                    }
+                    break;
+                }
+            }
+        }
+        break;
+    }
+    actions
+}
+
+fn normalize_django_router_prefix(prefix: &str) -> Option<String> {
+    let trimmed = prefix.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(format!("{}/", trimmed))
+    }
+}
+
+pub fn extract_django_endpoints(content: &str) -> Vec<ExtractedEndpoint> {
+    let mut endpoints = extract_django_path_calls(content);
+    let masked = mask_python_comments_and_strings(content);
+
+    // DRF router.register()
+    for mat in DJANGO_ROUTER_REGISTER_START_RE.captures_iter(&masked) {
+        let Some(full_match) = mat.get(0) else {
+            continue;
+        };
+        let router_name = mat.get(1).map(|name| name.as_str().to_string());
+        let open_paren = full_match.end() - 1;
+        let Some(close_paren) = find_balanced_call(content, open_paren) else {
+            continue;
+        };
+        let args = split_top_level_args(&content[open_paren + 1..close_paren - 1]);
+        if args.len() < 2 {
+            continue;
+        }
+        let Some(prefix) = parse_django_string_arg(&args[0]) else {
+            continue;
+        };
+        let viewset = args[1].trim();
+        let line_num = line_number_at(content, full_match.start());
+        if let Some(path_pattern) = normalize_django_router_prefix(&prefix) {
+            let handler_qname = normalize_django_handler_name(viewset);
+            let known_actions = extract_django_viewset_actions(content, viewset);
+            endpoints.push(ExtractedEndpoint {
+                method: None,
+                path_pattern: path_pattern.clone(),
+                line: line_num,
+                handler_qname: handler_qname.clone(),
+                action_name: None,
+                router_generated: true,
+                router_name: router_name.clone(),
+            });
+
+            for (method, action_name, detail) in [
+                ("GET", "list", false),
+                ("POST", "create", false),
+                ("GET", "retrieve", true),
+                ("PUT", "update", true),
+                ("PATCH", "partial_update", true),
+                ("DELETE", "destroy", true),
+            ] {
+                if !known_actions.contains(action_name) {
+                    continue;
+                }
+                endpoints.push(ExtractedEndpoint {
+                    method: Some(method.to_string()),
+                    path_pattern: if detail {
+                        format!("{}{}/", path_pattern, "{id}")
+                    } else {
+                        path_pattern.clone()
+                    },
+                    line: line_num,
+                    handler_qname: handler_qname.clone(),
+                    action_name: Some(action_name.to_string()),
+                    router_generated: true,
+                    router_name: router_name.clone(),
+                });
+            }
+        }
+    }
+
+    // DRF tuple endpoints: ("prefix", SomeViewSet)
+    for caps in DJANGO_TUPLE_ENDPOINT_RE.captures_iter(content) {
+        let Some(full_match) = caps.get(0) else {
+            continue;
+        };
+        if masked.as_bytes().get(full_match.start()) == Some(&b' ') {
+            continue;
+        }
+        let previous_code_char = masked[..full_match.start()]
+            .chars()
+            .rev()
+            .find(|ch| !ch.is_whitespace());
+        if previous_code_char
+            .map(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let prefix = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let viewset = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+        if !prefix.is_empty() {
+            endpoints.push(ExtractedEndpoint {
+                method: None,
+                path_pattern: prefix.to_string(),
+                line: line_number_at(content, full_match.start()),
+                handler_qname: normalize_django_handler_name(viewset),
+                action_name: None,
+                router_generated: false,
+                router_name: None,
+            });
+        }
+    }
+
+    // dedup by (line, path_pattern, method) — overlapping regexes may produce duplicates,
+    // but DRF as_view can declare several HTTP methods for the same route on one line.
+    endpoints.sort_by(|a, b| {
+        a.line
+            .cmp(&b.line)
+            .then(a.path_pattern.cmp(&b.path_pattern))
+            .then(a.method.cmp(&b.method))
+    });
+    endpoints.dedup_by(|a, b| {
+        a.line == b.line && a.path_pattern == b.path_pattern && a.method == b.method
+    });
+
+    endpoints
+}
+
+/// Extract @action decorators and bind them to the following function.
+///
+/// The code mask excludes comments and strings while preserving offsets. The
+/// decorator call is then balanced in the mask, allowing normal multiline
+/// arguments without treating commented-out examples as real routes.
+pub fn extract_django_actions(content: &str) -> Vec<ExtractedAction> {
+    let mut actions = Vec::new();
+    let masked = mask_python_comments_and_strings(content);
+
+    for matched in DJANGO_ACTION_START_RE.find_iter(&masked) {
+        let action_start = matched.start();
+        let open_paren = matched.end() - 1;
+        let Some(call_end) = find_balanced_call(&masked, open_paren) else {
+            continue;
+        };
+        let raw_params = &content[open_paren + 1..call_end - 1];
+        let params = mask_python_comments(raw_params);
+
+        let mut current_class: Option<String> = None;
+        let mut class_indent = 0usize;
+        for line in masked[..action_start].lines() {
+            let trimmed = line.trim();
+            let indent = line.len() - line.trim_start().len();
+            if trimmed.starts_with("class ") {
+                if let Some(end) = trimmed.find(['(', ':']) {
+                    current_class = Some(trimmed["class ".len()..end].trim().to_string());
+                    class_indent = indent;
+                }
+            } else if current_class.is_some()
+                && !trimmed.is_empty()
+                && indent <= class_indent
+                && !trimmed.starts_with('@')
+                && !trimmed.starts_with("def ")
+                && !trimmed.starts_with("async def ")
+            {
+                current_class = None;
+            }
+        }
+
+        let mut func_name = None;
+        for next_line in masked[call_end..].lines() {
+            let next = next_line.trim();
+            if next.is_empty() || next.starts_with('@') {
+                continue;
+            }
+            let name_start = if next.starts_with("async def ") {
+                "async def ".len()
+            } else if next.starts_with("def ") {
+                "def ".len()
+            } else {
+                break;
+            };
+            if let Some(paren) = next[name_start..].find('(') {
+                func_name = Some(next[name_start..name_start + paren].to_string());
+            }
+            break;
+        }
+        let Some(handler_name) = func_name else {
+            continue;
+        };
+
+        let methods: Vec<String> = DJANGO_ACTION_METHODS_RE
+            .captures(&params)
+            .map(|mc| {
+                let list = mc.get(1).map(|m| m.as_str()).unwrap_or("");
+                list.split(',')
+                    .map(|s| s.trim().trim_matches('"').trim_matches('\'').to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let url_path = DJANGO_ACTION_URL_PATH_RE
+            .captures(&params)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string());
+        let detail = DJANGO_ACTION_DETAIL_RE
+            .captures(&params)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str() == "True")
+            .unwrap_or(false);
+        let path_suffix = url_path.unwrap_or_else(|| handler_name.clone());
+        let line = line_number_at(content, action_start);
+        let methods = if methods.is_empty() {
+            vec!["GET".to_string()]
+        } else {
+            methods
+        };
+
+        for method in methods {
+            actions.push(ExtractedAction {
+                method: Some(method),
+                path_suffix: path_suffix.clone(),
+                line,
+                handler_name: Some(handler_name.clone()),
+                owner_class: current_class.clone(),
+                detail,
+            });
+        }
+    }
+
+    actions
+}
+
+/// Extract ModelSerializer.Meta.model relationships from file content
+pub fn extract_django_serializer_models(content: &str) -> Vec<ExtractedSerializerModel> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = content.lines().collect();
+
+    // state: which class and Meta scope we are currently inside
+    let mut current_class: Option<String> = None;
+    let mut in_meta = false;
+    let mut class_indent = 0;
+    let mut meta_indent = 0;
+
+    for (i, line) in lines.iter().enumerate() {
+        let stripped = line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        // skip blank lines and comments
+        if stripped.is_empty() || stripped.starts_with('#') {
+            continue;
+        }
+
+        // detect class Meta: inside serializer (before handling regular classes)
+        if current_class.is_some()
+            && stripped.starts_with("class Meta")
+            && stripped.contains(':')
+            && indent > class_indent
+        {
+            in_meta = true;
+            meta_indent = indent;
+            continue;
+        }
+
+        // detect class ... (with Serializer in bases)
+        if stripped.starts_with("class ") {
+            if stripped.contains("Serializer") {
+                // extract class name
+                if let Some(paren) = stripped.find('(') {
+                    let name = stripped["class ".len()..paren].trim();
+                    current_class = Some(name.to_string());
+                    class_indent = indent;
+                    in_meta = false;
+                } else if let Some(colon) = stripped.find(':') {
+                    let name = stripped["class ".len()..colon].trim();
+                    current_class = Some(name.to_string());
+                    class_indent = indent;
+                    in_meta = false;
+                }
+            } else if indent <= class_indent {
+                // new class at same/outer level -- reset
+                current_class = None;
+                in_meta = false;
+            }
+            continue;
+        }
+
+        // leaving class scope
+        if current_class.is_some() && indent <= class_indent && !stripped.is_empty() {
+            current_class = None;
+            in_meta = false;
+            continue;
+        }
+
+        if current_class.is_some() {
+            // leaving Meta scope
+            if in_meta && indent <= meta_indent && !stripped.is_empty() {
+                in_meta = false;
+            }
+
+            // inside Meta -- look for model = ...
+            if in_meta {
+                if let Some(caps) = DJANGO_META_MODEL_RE.captures(stripped) {
+                    let model_name = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+                    if !model_name.is_empty() {
+                        results.push(ExtractedSerializerModel {
+                            serializer_name: current_class.clone().unwrap_or_default(),
+                            model_name: model_name.to_string(),
+                            line: i + 1,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    results
+}
+
+/// Extract settings/env usages from file content
+pub fn extract_django_settings(content: &str) -> Vec<ExtractedSettingUsage> {
+    let mut results = Vec::new();
+    let mut current_class: Option<(String, usize)> = None;
+    let mut current_func: Option<(String, usize)> = None;
+
+    let masked_content = mask_python_comments_and_strings(content);
+
+    for (line_num, (line, masked_line)) in content.lines().zip(masked_content.lines()).enumerate() {
+        let line_num = line_num + 1;
+        let trimmed = line.trim();
+        let masked_trimmed = masked_line.trim();
+        let indent = line.len() - line.trim_start().len();
+
+        // skip comments and lines fully masked as strings/comments
+        if masked_trimmed.is_empty() {
+            continue;
+        }
+
+        if current_func
+            .as_ref()
+            .map(|(_, scope_indent)| indent <= *scope_indent)
+            .unwrap_or(false)
+        {
+            current_func = None;
+        }
+        if current_class
+            .as_ref()
+            .map(|(_, scope_indent)| indent <= *scope_indent)
+            .unwrap_or(false)
+            && !masked_trimmed.starts_with("class ")
+        {
+            current_class = None;
+        }
+
+        // Track class and method scopes independently. Method settings carry
+        // a class-qualified context so same-named ViewSet actions cannot bind
+        // to the first function in the file.
+        if masked_trimmed.starts_with("class ") {
+            if let Some(end) = masked_trimmed.find(['(', ':']) {
+                current_class = Some((trimmed["class ".len()..end].trim().to_string(), indent));
+                current_func = None;
+            }
+        } else if masked_trimmed.starts_with("def ") || masked_trimmed.starts_with("async def ") {
+            let start = if masked_trimmed.starts_with("async def ") {
+                "async def ".len()
+            } else {
+                "def ".len()
+            };
+            if let Some(paren) = masked_trimmed[start..].find('(') {
+                current_func = Some((trimmed[start..start + paren].to_string(), indent));
+            }
+        }
+        let context_symbol = current_func
+            .as_ref()
+            .map(|(method, _)| match current_class.as_ref() {
+                Some((class, _)) => format!("{class}.{method}"),
+                None => method.clone(),
+            })
+            .or_else(|| current_class.as_ref().map(|(class, _)| class.clone()));
+
+        // settings.SOME_KEY
+        for caps in DJANGO_SETTINGS_RE.captures_iter(&masked_line) {
+            let key = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            if !key.is_empty() {
+                results.push(ExtractedSettingUsage {
+                    key: key.to_string(),
+                    key_kind: "settings".to_string(),
+                    line: line_num,
+                    context_symbol: context_symbol.clone(),
+                });
+            }
+        }
+
+        // os.getenv("KEY") / os.environ.get("KEY")
+        for caps in DJANGO_GETENV_START_RE.captures_iter(&masked_line) {
+            let Some(start_match) = caps.get(0) else {
+                continue;
+            };
+            let open_paren = start_match.end() - 1;
+            let Some(close_paren) = find_balanced_call(line, open_paren) else {
+                continue;
+            };
+            let args = split_top_level_args(&line[open_paren + 1..close_paren - 1]);
+            let Some(key) = args.first().and_then(|arg| parse_django_string_arg(arg)) else {
+                continue;
+            };
+            results.push(ExtractedSettingUsage {
+                key,
+                key_kind: "env".to_string(),
+                line: line_num,
+                context_symbol: context_symbol.clone(),
+            });
+        }
+
+        // os.environ["KEY"]
+        for caps in DJANGO_ENVIRON_INDEX_START_RE.captures_iter(&masked_line) {
+            let Some(start_match) = caps.get(0) else {
+                continue;
+            };
+            let bracket_start = start_match.end() - 1;
+            let Some(bracket_end) = line[bracket_start..]
+                .find(']')
+                .map(|pos| bracket_start + pos)
+            else {
+                continue;
+            };
+            let Some(key) = parse_django_string_arg(&line[bracket_start + 1..bracket_end]) else {
+                continue;
+            };
+            results.push(ExtractedSettingUsage {
+                key,
+                key_kind: "env".to_string(),
+                line: line_num,
+                context_symbol: context_symbol.clone(),
+            });
+        }
+
+        // env("KEY"), env.str("KEY"), config("KEY")
+        for caps in DJANGO_ENV_START_RE.captures_iter(&masked_line) {
+            let key_kind = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+            let Some(start_match) = caps.get(0) else {
+                continue;
+            };
+            let open_paren = start_match.end() - 1;
+            let Some(close_paren) = find_balanced_call(line, open_paren) else {
+                continue;
+            };
+            let args = split_top_level_args(&line[open_paren + 1..close_paren - 1]);
+            let Some(key) = args.first().and_then(|arg| parse_django_string_arg(arg)) else {
+                continue;
+            };
+            results.push(ExtractedSettingUsage {
+                key,
+                key_kind: key_kind.to_string(),
+                line: line_num,
+                context_symbol: context_symbol.clone(),
+            });
+        }
+    }
+
+    results
+}
+
+/// Resolve an indexed relative path against primary and extra roots.
+pub fn resolve_indexed_file_path(
+    root: &Path,
+    extra_roots: &[String],
+    rel_path: &str,
+    root_path: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(root_path) = root_path.filter(|value| !value.is_empty()) {
+        let candidate = PathBuf::from(root_path).join(rel_path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    std::iter::once(root.to_path_buf())
+        .chain(extra_roots.iter().map(PathBuf::from))
+        .map(|candidate_root| candidate_root.join(rel_path))
+        .find(|candidate| candidate.exists())
+}
+
+/// Resolve a Django class name by preferring the current file, then imports.
+fn resolve_django_name_to_symbol_in_file(
+    conn: &rusqlite::Connection,
+    name: &str,
+    file_id: i64,
+    import_map: &[DjangoImport],
+    current_rel_path: &str,
+    current_root_path: Option<&str>,
+) -> Option<(i64, String)> {
+    db::find_django_symbol_in_file(conn, name, file_id, Some("class"))
+        .and_then(|symbol_id| {
+            db::get_django_symbol(conn, symbol_id).map(|symbol| (symbol_id, symbol.path))
+        })
+        .or_else(|| {
+            resolve_django_name_to_symbol(
+                conn,
+                name,
+                import_map,
+                current_rel_path,
+                current_root_path,
+            )
+        })
+}
+
+fn compose_django_route_path(prefix: &str, child: &str) -> String {
+    let prefix = prefix.trim_matches('/');
+    let child = child.trim_matches('/');
+
+    match (prefix.is_empty(), child.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => format!("{}/", child),
+        (false, true) => format!("{}/", prefix),
+        (false, false) => format!("{}/{}/", prefix, child),
+    }
+}
+
+fn build_django_action_path(prefix: Option<&str>, detail: bool, path_suffix: &str) -> String {
+    let prefix = prefix.unwrap_or("").trim_matches('/');
+    let suffix = path_suffix.trim_matches('/');
+
+    let mut parts: Vec<&str> = Vec::new();
+    if !prefix.is_empty() {
+        parts.push(prefix);
+    }
+    if detail {
+        parts.push("{id}");
+    }
+    if !suffix.is_empty() {
+        parts.push(suffix);
+    }
+
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parts.join("/"))
+    }
+}
+
+fn resolve_django_action_prefixes(
+    conn: &rusqlite::Connection,
+    owner_class: Option<&str>,
+    action_file_id: i64,
+) -> Vec<String> {
+    owner_class
+        .map(|class_name| db::find_django_action_prefixes(conn, class_name, action_file_id))
+        .unwrap_or_default()
+}
+
+/// Extract and persist Django/DRF framework facts for indexed files
+pub fn extract_django_facts(
+    conn: &mut Connection,
+    root: &Path,
+    progress: bool,
+) -> Result<(usize, usize, usize)> {
+    use crate::db;
+
+    db::clear_django_graph(conn)?;
+
+    let django_files = db::list_django_python_files(conn)?;
+
+    if django_files.is_empty() {
+        db::mark_django_graph_materialized(conn)?;
+        return Ok((0, 0, 0));
+    }
+
+    if progress {
+        eprintln!(
+            "Extracting Django/DRF facts from {} files...",
+            django_files.len()
+        );
+    }
+
+    let mut endpoint_count = 0;
+    let mut serializer_count = 0;
+    let mut setting_count = 0;
+    let mut pending_actions: Vec<(i64, ExtractedAction)> = Vec::new();
+    let mut url_modules: Vec<(
+        i64,
+        String,
+        String,
+        Vec<DjangoImport>,
+        Vec<ExtractedEndpoint>,
+        Vec<ExtractedInclude>,
+    )> = Vec::new();
+    let extra_roots = db::get_extra_roots(conn).unwrap_or_default();
+
+    let tx = conn.transaction()?;
+
+    for (file_id, rel_path, root_path) in &django_files {
+        let root_hint = Some(root_path.as_str()).filter(|value| !value.is_empty());
+        let Some(file_path) = resolve_indexed_file_path(root, &extra_roots, rel_path, root_hint)
+        else {
+            continue;
+        };
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let import_map = build_django_import_map(&content);
+
+        let endpoints = extract_django_endpoints(&content);
+
+        let includes = extract_django_includes(&content);
+        url_modules.push((
+            *file_id,
+            rel_path.clone(),
+            root_path.clone(),
+            import_map.clone(),
+            endpoints.clone(),
+            includes,
+        ));
+
+        for action in extract_django_actions(&content) {
+            pending_actions.push((*file_id, action));
+        }
+
+        let ser_models = extract_django_serializer_models(&content);
+        for sm in &ser_models {
+            let ser_id = db::find_django_symbol_in_file(&tx, &sm.serializer_name, *file_id, None);
+            let model_id = resolve_django_name_to_symbol_in_file(
+                &tx,
+                &sm.model_name,
+                *file_id,
+                &import_map,
+                rel_path,
+                root_hint,
+            )
+            .map(|(symbol_id, _path)| symbol_id);
+            if let (Some(sid), Some(mid)) = (ser_id, model_id) {
+                db::insert_django_serializer_model(&tx, sid, mid, "high", Some("Meta.model"))?;
+                serializer_count += 1;
+            }
+        }
+
+        let handler_serializers = extract_django_handler_serializers(&content);
+        for (class_name, serializer_name, _line) in &handler_serializers {
+            let handler_id = db::find_django_symbol_in_file(&tx, class_name, *file_id, None);
+
+            let serializer_info = resolve_django_name_to_symbol(
+                &tx,
+                serializer_name,
+                &import_map,
+                rel_path,
+                root_hint,
+            );
+
+            if let (Some(h_id), Some((s_id, _s_path))) = (handler_id, serializer_info) {
+                let confidence = if import_map
+                    .iter()
+                    .any(|imp| imp.local_name == *serializer_name)
+                {
+                    "high"
+                } else {
+                    "medium"
+                };
+                db::insert_django_handler_serializer(
+                    &tx,
+                    h_id,
+                    s_id,
+                    confidence,
+                    Some("serializer_class"),
+                )?;
+            }
+        }
+
+        let settings = extract_django_settings(&content);
+        for su in &settings {
+            let sym_id = su
+                .context_symbol
+                .as_deref()
+                .and_then(|context| db::find_django_symbol_by_context(&tx, context, *file_id));
+
+            if let Some(sid) = sym_id {
+                db::insert_django_symbol_setting(
+                    &tx,
+                    sid,
+                    &su.key,
+                    &su.key_kind,
+                    su.line,
+                    "medium",
+                    Some(&format!("{}:{}", rel_path, su.line)),
+                )?;
+            } else {
+                db::insert_django_file_setting(
+                    &tx,
+                    *file_id,
+                    &su.key,
+                    &su.key_kind,
+                    su.line,
+                    "medium",
+                    Some(&format!("{}:{}", rel_path, su.line)),
+                )?;
+            }
+            setting_count += 1;
+        }
+    }
+
+    let url_module_by_path: HashMap<(String, String), usize> = url_modules
+        .iter()
+        .enumerate()
+        .map(
+            |(idx, (_file_id, rel_path, root_path, _imports, _endpoints, _includes))| {
+                ((root_path.clone(), rel_path.clone()), idx)
+            },
+        )
+        .collect();
+
+    let included_module_indices: HashSet<usize> = url_modules
+        .iter()
+        .flat_map(
+            |(_file_id, parent_rel_path, parent_root_path, _imports, _endpoints, includes)| {
+                includes.iter().flat_map(|include| {
+                    module_path_to_file_candidates(parent_rel_path, &include.module_path)
+                        .into_iter()
+                        .filter_map(|candidate| {
+                            url_module_by_path
+                                .get(&(parent_root_path.clone(), candidate))
+                                .copied()
+                        })
+                })
+            },
+        )
+        .collect();
+
+    // Materialize only routes reachable from a top-level URLConf. Traversal
+    // carries the complete prefix, so nested includes have one mounted path
+    // per parent mount and no unmounted child duplicate is ever inserted.
+    let mut pending_mounts: Vec<(usize, String, i64, usize)> = url_modules
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !included_module_indices.contains(index))
+        .map(
+            |(index, (file_id, _path, _root, _imports, _endpoints, _includes))| {
+                (index, String::new(), *file_id, 0)
+            },
+        )
+        .collect();
+    let mut visited_mounts = HashSet::new();
+
+    while let Some((module_idx, prefix, mounted_file_id, mounted_line)) = pending_mounts.pop() {
+        if !visited_mounts.insert((module_idx, prefix.clone())) {
+            continue;
+        }
+        let (file_id, rel_path, root_path, imports, endpoints, includes) = &url_modules[module_idx];
+        let root_hint = Some(root_path.as_str()).filter(|value| !value.is_empty());
+
+        let mut router_mount_prefixes: HashMap<&str, Vec<String>> = HashMap::new();
+        for include in includes
+            .iter()
+            .filter(|include| include.module_path == "__router_urls__")
+        {
+            if let Some(router_name) = include.router_name.as_deref() {
+                router_mount_prefixes
+                    .entry(router_name)
+                    .or_default()
+                    .push(compose_django_route_path(&prefix, &include.prefix));
+            }
+        }
+
+        for endpoint in endpoints {
+            let mut resolved_handler_symbol_id = None;
+            let mut resolved_handler_name = None;
+            let mut handler_confidence = "medium";
+            if let Some(handler) = &endpoint.handler_qname {
+                if let Some((symbol_id, _path)) = resolve_django_name_to_symbol_in_file(
+                    &tx, handler, *file_id, imports, rel_path, root_hint,
+                ) {
+                    let qualifier = handler.split('.').next().unwrap_or(handler);
+                    handler_confidence =
+                        if imports.iter().any(|import| import.local_name == qualifier) {
+                            "high"
+                        } else {
+                            "medium"
+                        };
+                    resolved_handler_name = db::get_django_symbol_name(&tx, symbol_id);
+                    resolved_handler_symbol_id = endpoint
+                        .action_name
+                        .as_deref()
+                        .and_then(|action| {
+                            db::find_django_owner_method_symbol(&tx, symbol_id, action)
+                        })
+                        .or(Some(symbol_id));
+                }
+            }
+            let mount_prefixes: Vec<String> = if endpoint.router_generated {
+                endpoint
+                    .router_name
+                    .as_deref()
+                    .and_then(|router_name| router_mount_prefixes.get(router_name))
+                    .cloned()
+                    .unwrap_or_default()
+            } else {
+                vec![prefix.clone()]
+            };
+            for mount_prefix in &mount_prefixes {
+                let endpoint_id = db::insert_django_endpoint(
+                    &tx,
+                    endpoint.method.as_deref(),
+                    &compose_django_route_path(mount_prefix, &endpoint.path_pattern),
+                    mounted_file_id,
+                    if mounted_line == 0 {
+                        endpoint.line
+                    } else {
+                        mounted_line
+                    },
+                    resolved_handler_name
+                        .as_deref()
+                        .or(endpoint.handler_qname.as_deref()),
+                )?;
+                if let Some(symbol_id) = resolved_handler_symbol_id {
+                    db::insert_django_endpoint_handler(
+                        &tx,
+                        endpoint_id,
+                        symbol_id,
+                        handler_confidence,
+                        Some("urlpatterns include composition"),
+                    )?;
+                }
+                endpoint_count += 1;
+            }
+
+            // Router registrations commonly import a ViewSet from another file.
+            // Expand only actions proven by that resolved class; the registration
+            // parser cannot safely infer inherited CRUD behavior from the URLConf.
+            if endpoint.router_generated && endpoint.method.is_none() {
+                if let Some(class_id) = resolved_handler_symbol_id {
+                    if let Some((class_path, class_root)) =
+                        db::get_django_symbol_file(&tx, class_id)
+                    {
+                        let class_root_hint =
+                            Some(class_root.as_str()).filter(|value| !value.is_empty());
+                        if class_path != *rel_path {
+                            if let Some(class_file) = resolve_indexed_file_path(
+                                root,
+                                &extra_roots,
+                                &class_path,
+                                class_root_hint,
+                            ) {
+                                if let Ok(class_content) = fs::read_to_string(class_file) {
+                                    let class_name = resolved_handler_name
+                                        .as_deref()
+                                        .or(endpoint.handler_qname.as_deref())
+                                        .unwrap_or("");
+                                    for (method, action_name, detail) in [
+                                        ("GET", "list", false),
+                                        ("POST", "create", false),
+                                        ("GET", "retrieve", true),
+                                        ("PUT", "update", true),
+                                        ("PATCH", "partial_update", true),
+                                        ("DELETE", "destroy", true),
+                                    ] {
+                                        if !extract_django_viewset_actions(
+                                            &class_content,
+                                            class_name,
+                                        )
+                                        .contains(action_name)
+                                        {
+                                            continue;
+                                        }
+                                        let action_symbol_id = db::find_django_owner_method_symbol(
+                                            &tx,
+                                            class_id,
+                                            action_name,
+                                        )
+                                        .or(Some(class_id));
+                                        let action_path = if detail {
+                                            format!("{}{}/", endpoint.path_pattern, "{id}")
+                                        } else {
+                                            endpoint.path_pattern.clone()
+                                        };
+                                        for mount_prefix in &mount_prefixes {
+                                            let endpoint_id = db::insert_django_endpoint(
+                                                &tx,
+                                                Some(method),
+                                                &compose_django_route_path(
+                                                    mount_prefix,
+                                                    &action_path,
+                                                ),
+                                                mounted_file_id,
+                                                if mounted_line == 0 {
+                                                    endpoint.line
+                                                } else {
+                                                    mounted_line
+                                                },
+                                                resolved_handler_name
+                                                    .as_deref()
+                                                    .or(endpoint.handler_qname.as_deref()),
+                                            )?;
+                                            if let Some(symbol_id) = action_symbol_id {
+                                                db::insert_django_endpoint_handler(
+                                                    &tx,
+                                                    endpoint_id,
+                                                    symbol_id,
+                                                    handler_confidence,
+                                                    Some("router ViewSet action"),
+                                                )?;
+                                            }
+                                            endpoint_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for include in includes {
+            for candidate in module_path_to_file_candidates(rel_path, &include.module_path) {
+                if let Some(child_idx) = url_module_by_path
+                    .get(&(root_path.clone(), candidate))
+                    .copied()
+                {
+                    pending_mounts.push((
+                        child_idx,
+                        compose_django_route_path(&prefix, &include.prefix),
+                        *file_id,
+                        include.line,
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    for (file_id, action) in &pending_actions {
+        // A ViewSet may be mounted through the same router more than once.
+        // Materialize each action under every collection prefix, not merely the
+        // first endpoint returned by a convenience lookup.
+        let prefixes = resolve_django_action_prefixes(&tx, action.owner_class.as_deref(), *file_id);
+        // @action belongs to a ViewSet and is public only through a router
+        // registration. Without a mounted collection prefix it is unreachable.
+        if prefixes.is_empty() {
+            continue;
+        }
+        let prefixes: Vec<Option<String>> = prefixes.into_iter().map(Some).collect();
+        let handler_qname = match (&action.owner_class, &action.handler_name) {
+            (Some(owner), Some(handler)) => Some(format!("{}.{}", owner, handler)),
+            (None, Some(handler)) => Some(handler.clone()),
+            _ => None,
+        };
+
+        for prefix in prefixes {
+            let path_pattern =
+                build_django_action_path(prefix.as_deref(), action.detail, &action.path_suffix);
+            let ep_id = db::insert_django_endpoint(
+                &tx,
+                action.method.as_deref(),
+                &path_pattern,
+                *file_id,
+                action.line,
+                handler_qname.as_deref(),
+            )?;
+
+            if let Some(handler) = &action.handler_name {
+                let sym_id = action.owner_class.as_deref().and_then(|owner| {
+                    db::find_django_symbol_in_file(&tx, owner, *file_id, Some("class")).and_then(
+                        |owner_id| db::find_django_owner_method_symbol(&tx, owner_id, handler),
+                    )
+                });
+                if let Some(sid) = sym_id {
+                    db::insert_django_endpoint_handler(
+                        &tx,
+                        ep_id,
+                        sid,
+                        "high",
+                        Some("@action decorator"),
+                    )?;
+                }
+            }
+            endpoint_count += 1;
+        }
+    }
+
+    db::mark_django_graph_materialized(&tx)?;
+    tx.commit()?;
+
+    if progress {
+        eprintln!(
+            "Extracted {} endpoints, {} serializer-model links, {} settings usages",
+            endpoint_count, serializer_count, setting_count
+        );
+    }
+
+    Ok((endpoint_count, serializer_count, setting_count))
+}
+
+/// Incremental extraction of Django/DRF facts for changed files only.
+/// Currently unused; reserved for future incremental re-indexing support.
+#[allow(dead_code)]
+pub fn extract_django_facts_for_files(
+    conn: &mut Connection,
+    root: &Path,
+    file_ids: &[i64],
+    progress: bool,
+) -> Result<(usize, usize, usize)> {
+    if file_ids.is_empty() {
+        return Ok((0, 0, 0));
+    }
+
+    // Django/DRF facts now span imports across multiple files (urls -> views -> serializers -> models).
+    // Until we track and invalidate the full dependency closure, prefer correctness over partial refresh.
+    extract_django_facts(conn, root, progress)
 }

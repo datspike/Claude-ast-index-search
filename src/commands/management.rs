@@ -784,6 +784,11 @@ pub fn cmd_rebuild(
         _ => {}
     }
 
+    if matches!(index_type, "all" | "files" | "symbols") {
+        // Graph facts are built in the private generation before sealing. An
+        // extraction error therefore drops staging and cannot alter readers.
+        indexer::extract_django_facts(&mut conn, root, verbose)?;
+    }
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }
@@ -1114,6 +1119,9 @@ fn cmd_rebuild_sub_projects(
     }
 
     finalize_rebuild_schema(&conn, verbose)?;
+    // Sub-project and auto-discovery rebuilds share the same staged graph
+    // refresh boundary as the standard rebuild.
+    indexer::extract_django_facts(&mut conn, root, verbose)?;
     db::mark_index_updated(&conn)?;
     db::mark_modules_indexed(&conn)?;
 
@@ -1138,6 +1146,12 @@ fn cmd_rebuild_sub_projects(
 /// Incrementally update the index
 pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
     let start = Instant::now();
+    // A durable publication marker can make lease acquisition reject the live
+    // generation. Recover it before opening any normal update path.
+    db::recover_interrupted_index_publication(root)?;
+    // Keep this order in sync with rebuild: a lease protects the published
+    // generation from GC before the mutation guard serializes writers.
+    let _project_lease = db::acquire_project_lease(root)?;
     let _mutation_guard = db::acquire_rebuild_guard(root)?;
 
     if !db::db_exists(root) {
@@ -1150,10 +1164,8 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
 
     let _experimental_fast_rebuild_env = ScopedEnvVar::set_bool(
         "AST_INDEX_EXPERIMENTAL_FAST_REBUILD",
-        crate::commands::try_is_experimental_fast_rebuild_enabled(root)?,
+        crate::commands::try_is_experimental_fast_rebuild_enabled_read_only(root)?,
     );
-
-    let mut conn = db::open_db_leased(root)?;
 
     // Load .ast-index.yaml so update honours the same include/exclude as rebuild.
     // Without this, update on a project with `include: [adfox, yabs/adfox]` would
@@ -1172,30 +1184,80 @@ pub fn cmd_update(root: &Path, verbose: bool) -> Result<()> {
         }
     }
 
-    println!("{}", "Checking for changes...".cyan());
-    let (updated, changed, deleted) = indexer::update_directory_incremental(
-        &mut conn,
-        root,
-        true,
-        config_include,
-        exclude_matcher.as_ref(),
-    )?;
-
-    if updated == 0 && deleted == 0 {
+    // Check the live manifest before allocating a private SQLite snapshot.
+    // A true no-op must not touch staging or publication artifacts.
+    let live = db::open_existing_db_read_only_leased(root)?;
+    let (has_changes, needs_dirty_recovery, needs_schema_migration, needs_graph_materialization) =
+        match live {
+            Some(conn) => (
+                indexer::incremental_update_has_changes(
+                    &conn,
+                    root,
+                    config_include,
+                    exclude_matcher.as_ref(),
+                )?,
+                db::has_index_update_dirty(&conn)?,
+                db::index_schema_migration_required(&conn, root)?,
+                db::django_graph_materialization_required(&conn)?,
+            ),
+            None => (false, false, false, false),
+        };
+    if !has_changes
+        && !needs_dirty_recovery
+        && !needs_schema_migration
+        && !needs_graph_materialization
+    {
         println!("{}", "Index is up to date.".green());
-    } else {
-        println!(
-            "{}",
-            format!(
-                "Updated: {} files ({} changed, {} deleted)",
-                updated + deleted,
-                changed,
-                deleted
-            )
-            .green()
-        );
+        return Ok(());
     }
 
+    // Never mutate the published connection. SQLite backup gives staging a
+    // consistent snapshot without copying SQLite sidecars or cache markers.
+    let live_db = db::get_db_path(root)?;
+    let staged = IndexStaging::create(&live_db, "update")?;
+    let mut conn = db::backup_live_db_to_staging(root, staged.db_path())?;
+
+    let (updated, changed, deleted) = if has_changes {
+        println!("{}", "Checking for changes...".cyan());
+        let counts = indexer::update_directory_incremental(
+            &mut conn,
+            root,
+            true,
+            config_include,
+            exclude_matcher.as_ref(),
+        )?;
+
+        // A full refresh is intentional: URL/include/import links cross changed
+        // files, so clearing only changed paths would leave stale graph facts.
+        indexer::extract_django_facts(&mut conn, root, verbose)?;
+        counts
+    } else {
+        // The filesystem is unchanged. A schema-only migration still needs
+        // the materialized graph reconstructed from already indexed files
+        // before the private generation is sealed and published.
+        if needs_schema_migration || needs_graph_materialization {
+            indexer::extract_django_facts(&mut conn, root, verbose)?;
+        }
+        // A dirty marker is likewise completed only in staging.
+        if needs_dirty_recovery {
+            db::complete_index_update(&mut conn)?;
+        }
+        (0, 0, 0)
+    };
+    db::seal_staged_db(conn, staged.db_path())?;
+    let publication = db::acquire_index_publication_guard(root)?;
+    publication.install_staged(staged.db_path())?;
+
+    println!(
+        "{}",
+        format!(
+            "Updated: {} files ({} changed, {} deleted)",
+            updated + deleted,
+            changed,
+            deleted
+        )
+        .green()
+    );
     if verbose {
         eprintln!("\n{}", format!("Time: {:?}", start.elapsed()).dimmed());
     }

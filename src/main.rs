@@ -661,6 +661,38 @@ enum Commands {
         #[arg(short, long, default_value = "50")]
         limit: usize,
     },
+    /// List Django/DRF endpoints.
+    #[command(name = "django.routes")]
+    DjangoRoutes {
+        /// Filter by path or handler substring.
+        query: Option<String>,
+        /// Max results.
+        #[arg(short, long, default_value = "100")]
+        limit: usize,
+    },
+    /// Trace endpoint -> handler -> serializer -> model -> settings.
+    #[command(name = "django.endpoint-trace")]
+    DjangoEndpointTrace {
+        /// Path pattern substring.
+        path_pattern: String,
+        /// HTTP method filter.
+        #[arg(long)]
+        method: Option<String>,
+    },
+    /// Find settings/env key usages.
+    #[command(name = "django.setting-usage")]
+    DjangoSettingUsage {
+        key: String,
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+    /// Show blast radius for a Django model.
+    #[command(name = "django.model-impact")]
+    DjangoModelImpact {
+        name: String,
+        #[arg(short, long, default_value = "5")]
+        limit: usize,
+    },
     // === Project Insights ===
     /// Show compact project map (key types per directory)
     Map {
@@ -822,7 +854,10 @@ fn main() -> Result<()> {
             | Commands::Changed { .. }
     );
     let changed_command = matches!(&cli.command, Commands::Changed { .. });
-    let release_command_publication = matches!(&cli.command, Commands::Watch);
+    // Update publishes a private replacement generation after its staged
+    // mutation, so root discovery must not retain a shared publication lock.
+    let release_command_publication =
+        matches!(&cli.command, Commands::Watch | Commands::Update { .. });
     let (root, mut command_cache_lease) = if changed_command {
         // `changed` discovers only VCS markers from the invocation directory.
         // It must never probe or create the ast-index cache.
@@ -835,9 +870,12 @@ fn main() -> Result<()> {
     } else {
         match &cli.command {
             Commands::Rebuild { .. } | Commands::Restore { .. } | Commands::Clear => {
-                let root = find_project_root_for_write()?;
-                (root, None)
+                (find_project_root_for_write()?, None)
             }
+            // An interrupted update may leave a durable publication marker;
+            // read-root discovery refuses such a marker before cmd_update can
+            // recover it. Update therefore has its own ancestor-cache discovery.
+            Commands::Update { .. } => (find_project_root_for_update_write()?, None),
             _ => {
                 let (root, lease) = find_project_root_for_read_with_lease(walk_up)?;
                 (root, lease)
@@ -846,7 +884,14 @@ fn main() -> Result<()> {
     };
     let format = cli.format.as_str();
 
-    // Migrate project DB from old kotlin-index to ast-index
+    // An update must recover a durable publication state before legacy-cache
+    // migration opens its generation. This preserves the normal migration
+    // path while keeping update's staged write lifecycle safe.
+    if matches!(&cli.command, Commands::Update { .. }) {
+        db::recover_interrupted_index_publication(&root)?;
+    }
+
+    // Migrate project DB from old kotlin-index to ast-index.
     if !cache_independent && command_cache_lease.is_none() {
         command_cache_lease = Some(db::migrate_legacy_project_with_lease(&root)?);
     }
@@ -1207,6 +1252,24 @@ fn main() -> Result<()> {
         }
         Commands::PerlImports { query, limit } => {
             commands::perl::cmd_perl_imports(&root, query.as_deref(), limit)
+        }
+        Commands::DjangoRoutes { query, limit } => {
+            commands::django::cmd_django_routes(&root, query.as_deref(), limit, format)
+        }
+        Commands::DjangoEndpointTrace {
+            path_pattern,
+            method,
+        } => commands::django::cmd_django_endpoint_trace(
+            &root,
+            method.as_deref(),
+            &path_pattern,
+            format,
+        ),
+        Commands::DjangoSettingUsage { key, limit } => {
+            commands::django::cmd_django_setting_usage(&root, &key, limit, format)
+        }
+        Commands::DjangoModelImpact { name, limit } => {
+            commands::django::cmd_django_model_impact(&root, &name, limit, format)
         }
         // Project insights
         Commands::Map {
@@ -1694,6 +1757,21 @@ fn shell_quote(arg: &str) -> String {
 
 fn find_project_root_for_write() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
+}
+
+fn find_project_root_for_update_write() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?;
+    let home = dirs::home_dir();
+    // `db_exists` deliberately rejects interrupted publication markers. An
+    // update must still discover that ancestor cache so it can recover the
+    // marker before opening it. Updates always prefer an initialized ancestor
+    // generation, including across nested project markers.
+    find_project_root_for_read_at_with_db(
+        &cwd,
+        home.as_deref(),
+        true,
+        db::db_exists_for_write_discovery,
+    )
 }
 
 /// After a successful rebuild/update, sweep index caches for other projects
