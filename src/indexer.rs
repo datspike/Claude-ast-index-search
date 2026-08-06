@@ -6530,6 +6530,7 @@ pub fn extract_django_facts(
     )> = Vec::new();
     let extra_roots = db::get_extra_roots(conn).unwrap_or_default();
 
+    let mut seen_handler_serializers: HashSet<(i64, i64)> = HashSet::new();
     let tx = conn.transaction()?;
 
     for (file_id, rel_path, root_path) in &django_files {
@@ -6600,13 +6601,15 @@ pub fn extract_django_facts(
                 } else {
                     "medium"
                 };
-                db::insert_django_handler_serializer(
-                    &tx,
-                    h_id,
-                    s_id,
-                    confidence,
-                    Some("serializer_class"),
-                )?;
+                if seen_handler_serializers.insert((h_id, s_id)) {
+                    db::insert_django_handler_serializer(
+                        &tx,
+                        h_id,
+                        s_id,
+                        confidence,
+                        Some("serializer_class"),
+                    )?;
+                }
             }
         }
 

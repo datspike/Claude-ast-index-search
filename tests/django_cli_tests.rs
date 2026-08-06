@@ -3,6 +3,7 @@
 //! Each command must honour the named subtree filter and keep text and JSON
 //! output usable against rows owned by an extra root.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -13,6 +14,39 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 static ENV_SERIAL: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+struct CacheEnvironment {
+    previous: Vec<(&'static str, Option<OsString>)>,
+}
+
+impl CacheEnvironment {
+    fn set(cache: &Path) -> Self {
+        let keys = [
+            "AST_INDEX_CACHE_DIR",
+            "AST_INDEX_DB_PATH",
+            "KOTLIN_INDEX_DB_PATH",
+        ];
+        let previous = keys
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
+        std::env::set_var("AST_INDEX_CACHE_DIR", cache);
+        std::env::remove_var("AST_INDEX_DB_PATH");
+        std::env::remove_var("KOTLIN_INDEX_DB_PATH");
+        Self { previous }
+    }
+}
+
+impl Drop for CacheEnvironment {
+    fn drop(&mut self) {
+        for (key, value) in self.previous.drain(..) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
 
 fn binary() -> &'static Path {
     Path::new(env!("CARGO_BIN_EXE_ast-index"))
@@ -439,6 +473,94 @@ fn endpoint_trace_uses_the_dispatched_viewset_serializer_in_a_shared_file() {
         "trace: {trace}"
     );
     assert_eq!(trace["model"]["name"], "SecondModel", "trace: {trace}");
+}
+
+#[test]
+fn django_rebuild_deduplicates_resolved_handler_serializer_pairs() {
+    let _lock = ENV_SERIAL.lock().unwrap();
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("project");
+    let _environment = CacheEnvironment::set(&temp.path().join("cache"));
+
+    write(
+        &root.join("Cargo.toml"),
+        "[package]\nname = \"fixture\"\nversion = \"0\"\n",
+    );
+    write(
+        &root.join("app/serializers.py"),
+        "from rest_framework import serializers\n\nclass DefaultSerializer(serializers.Serializer):\n    pass\n\nclass ActionSerializer(serializers.Serializer):\n    pass\n",
+    );
+    write(
+        &root.join("app/views.py"),
+        "from rest_framework import viewsets\nfrom rest_framework.decorators import action\nfrom rest_framework.response import Response\nfrom .serializers import ActionSerializer, DefaultSerializer\n\nclass UserViewSet(viewsets.GenericViewSet):\n    serializer_class = DefaultSerializer\n\n    def get_serializer_class(self):\n        if self.action == \"special\":\n            return ActionSerializer\n        return DefaultSerializer\n\n    @action(detail=False, methods=[\"get\"])\n    def special(self, request):\n        return Response([])\n",
+    );
+    write(
+        &root.join("app/urls.py"),
+        "from rest_framework.routers import DefaultRouter\nfrom .views import UserViewSet\n\nrouter = DefaultRouter()\nrouter.register(\"users\", UserViewSet, basename=\"user\")\nurlpatterns = router.urls\n",
+    );
+
+    let assert_relations = |conn: &Connection| {
+        let handler_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = ?1",
+                ["UserViewSet"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let default_serializer_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = ?1",
+                ["DefaultSerializer"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let action_serializer_id: i64 = conn
+            .query_row(
+                "SELECT id FROM symbols WHERE name = ?1",
+                ["ActionSerializer"],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let relation_count = |serializer_id| {
+            conn.query_row(
+                "SELECT COUNT(*) FROM django_handler_serializers WHERE handler_symbol_id = ?1 AND serializer_symbol_id = ?2",
+                [handler_id, serializer_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(relation_count(default_serializer_id), 1);
+        assert_eq!(relation_count(action_serializer_id), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM django_handler_serializers WHERE handler_symbol_id = ?1",
+                [handler_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM (SELECT 1 FROM django_handler_serializers GROUP BY handler_symbol_id, serializer_symbol_id HAVING COUNT(*) > 1)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+    };
+
+    assert_success(&run(&root, &["rebuild"]));
+    let db_path = db::get_db_path(&root).unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    assert_relations(&conn);
+    drop(conn);
+
+    assert_success(&run(&root, &["rebuild"]));
+    let conn = Connection::open(&db_path).unwrap();
+    assert_relations(&conn);
 }
 
 #[test]
